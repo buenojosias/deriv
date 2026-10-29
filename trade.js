@@ -9,7 +9,7 @@ const { getBestDigit } = require("./deriv_digits"); // módulo anterior
 // ---------------- CONFIGURAÇÕES ----------------
 const CONFIG = {
   app_id: 1089,
-  api_token: process.env.DERIV_API_TOKEN || "EdpMgnAcCpb4X1Y", // recomenda usar VAR DE AMBIENTE
+  api_token: process.env.DERIV_API_TOKEN || "pat_6b14059c618cf434a7f2e11a3ae014aed10c1f17828b46b69a4d6e141a4e2bd0", // recomenda usar VAR DE AMBIENTE
   symbol: "R_25",
   initial_stake: 0.35,
   max_attempts: 20,
