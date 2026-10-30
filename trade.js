@@ -16,14 +16,15 @@ const CONFIG = {
   wait_after_target: 6,
 };
 
-async function chooseDigit(suggested, question) {
-  const answer = (await question(`Dígito sugerido: ${suggested}. Iniciar? (s/n): `)).trim().toLowerCase();
-  if (answer === "s") return suggested;
-  const manual = (await question("Escolher outro dígito? (s/n): ")).trim().toLowerCase();
-  if (manual !== "s") return null;
-  const value = (await question("Dígito (0-9): ")).trim();
-  if (!/^[0-9]$/.test(value)) throw new Error("O dígito alvo deve ser um inteiro de 0 a 9");
-  return Number(value);
+async function confirmAnalysis(initialAnalysis, question, analyze) {
+  let analysis = initialAnalysis;
+  while (true) {
+    if (analysis.bestDigit == null) throw new Error("Histórico de ticks vazio");
+    const answer = (await question(`Dígito sugerido: ${analysis.bestDigit}. Iniciar? (s/n): `)).trim().toLowerCase();
+    if (answer === "s") return analysis;
+    if (answer === "n") analysis = await analyze(true);
+    else console.log("Responda s ou n.");
+  }
 }
 
 class DerivTrader {
@@ -390,14 +391,9 @@ class DerivTrader {
         return;
       }
       const analysis = await analyze(true);
-      if (analysis.bestDigit == null) throw new Error("Histórico vazio");
-      const digit = await chooseDigit(analysis.bestDigit, (prompt) => rl.question(prompt));
-      if (digit == null) {
-        this.ws?.close();
-        return;
-      }
-      this.target_digit = digit;
-      this.analysis = analysis;
+      const confirmed = await confirmAnalysis(analysis, (prompt) => rl.question(prompt), analyze);
+      this.target_digit = confirmed.bestDigit;
+      this.analysis = confirmed;
       this.state = "ANALYZING";
       this.digits_after_target = 0;
       this.digits_before_count = [];
@@ -427,17 +423,14 @@ async function main() {
   }
   console.log("🤖 DERIV TRADING BOT - DÍGITO COMBINA");
   const analysis = await getDigitAnalysis(true);
-  const suggested = analysis.bestDigit;
-  if (suggested == null) throw new Error("Histórico de ticks vazio");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  let digit;
+  let confirmed;
   try {
-    digit = await chooseDigit(suggested, (prompt) => rl.question(prompt));
+    confirmed = await confirmAnalysis(analysis, (prompt) => rl.question(prompt), getDigitAnalysis);
   } finally {
     rl.close();
   }
-  if (digit == null) return;
-  const trader = new DerivTrader(digit, analysis);
+  const trader = new DerivTrader(confirmed.bestDigit, confirmed);
   await trader.connect();
 }
 
@@ -448,4 +441,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { DerivTrader, CONFIG, chooseDigit };
+module.exports = { DerivTrader, CONFIG, confirmAnalysis };

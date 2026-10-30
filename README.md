@@ -18,7 +18,7 @@ O script pede confirmação antes de operar. Cada sequência pode fazer até 20 
 
 Depois da primeira compra, cada tick seguinte decide o ciclo: se o dígito for diferente do alvo, o bot envia outra compra imediatamente, sem aguardar a resposta da anterior. Se for igual, para de enviar compras e espera a liquidação das ordens pendentes para montar o relatório. O limite de 20 compras também interrompe novos envios.
 
-Ao escolher iniciar outro ciclo, o bot analisa novamente os 50 ticks e mostra o dígito sugerido. Ele aguarda sua confirmação para operar com esse dígito ou permite escolher outro manualmente, como no primeiro ciclo. A contagem só recomeça depois dessa escolha.
+Ao escolher iniciar outro ciclo, o bot analisa novamente os 50 ticks e mostra o dígito sugerido. Em qualquer ciclo, responda `s` para iniciar com a sugestão ou `n` para refazer a análise dos 50 ticks e receber outra sugestão. A contagem só recomeça após a confirmação.
 
 Ao fim de cada ciclo, o bot salva um arquivo `.txt` na pasta `results/` com símbolo, dígito alvo, contrato, valor da entrada e dígito de saída de cada ordem, além dos totais. Se a Deriv não informar `exit_spot` em um contrato, o dígito aparece como `indisponível`.
 O final do arquivo contém a análise dos 50 ticks (últimos 10 e frequência dos dígitos), a sequência observada até aparecer o dígito alvo que inicia a contagem (hora, preço e dígito em cada linha) e cada tick da contagem antes da primeira compra. Se o alvo reaparecer durante a contagem, o valor registrado volta a zero.

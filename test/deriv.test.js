@@ -8,16 +8,31 @@ const { DigitAnalyzer } = require("../deriv_digits");
 const { loadEnv } = require("../load_env");
 const { exitDigit } = require("../result_report");
 
-test("a escolha do dígito permite confirmar, trocar ou cancelar", async () => {
+test("recusar o dígito sugerido refaz a análise até haver confirmação", async () => {
   process.env.DERIV_API_TOKEN = "teste";
   process.env.DERIV_APP_ID = "123";
   process.env.DERIV_ACCOUNT_ID = "DOT123";
-  const { chooseDigit } = require("../trade");
+  const { confirmAnalysis } = require("../trade");
   const answers = (values) => async () => values.shift();
-  assert.equal(await chooseDigit(4, answers(["s"])), 4);
-  assert.equal(await chooseDigit(4, answers(["n", "s", "8"])), 8);
-  assert.equal(await chooseDigit(4, answers(["n", "n"])), null);
-  await assert.rejects(chooseDigit(4, answers(["n", "s", "10"])), /dígito alvo/);
+  const first = { bestDigit: 4, count: 50 };
+  const second = { bestDigit: 8, count: 50 };
+  const third = { bestDigit: 2, count: 50 };
+  assert.equal(await confirmAnalysis(first, answers(["s"]), async () => {
+    throw new Error("Não deve analisar novamente");
+  }), first);
+  const analyses = [second, third];
+  const prompts = [];
+  const replies = ["n", "n", "s"];
+  const confirmed = await confirmAnalysis(first, async (prompt) => {
+    prompts.push(prompt);
+    return replies.shift();
+  }, async () => analyses.shift());
+  assert.equal(confirmed, third);
+  assert.deepEqual(prompts, [
+    "Dígito sugerido: 4. Iniciar? (s/n): ",
+    "Dígito sugerido: 8. Iniciar? (s/n): ",
+    "Dígito sugerido: 2. Iniciar? (s/n): ",
+  ]);
 });
 
 test("novo ciclo aguarda confirmação após a análise antes de assinar ticks", async () => {
@@ -37,23 +52,28 @@ test("novo ciclo aguarda confirmação após a análise antes de assinar ticks",
     question: (prompt) => {
       prompts.push(prompt);
       if (prompts.length === 1) return Promise.resolve("s");
+      if (prompts.length === 2) return Promise.resolve("n");
       return new Promise((resolve) => { answerSuggestion = resolve; });
     },
     close: () => {},
   };
-  const analysis = { bestDigit: 3, count: 50, last10: [], frequency: [] };
-  const restarting = trader.askRestart({ analyze: async () => analysis, createInterface: () => rl });
+  const analyses = [
+    { bestDigit: 3, count: 50, last10: [], frequency: [] },
+    { bestDigit: 8, count: 50, last10: [], frequency: [] },
+  ];
+  const restarting = trader.askRestart({ analyze: async () => analyses.shift(), createInterface: () => rl });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(prompts.length, 2);
+  assert.equal(prompts.length, 3);
   assert.match(prompts[1], /Dígito sugerido: 3\. Iniciar\?/);
+  assert.match(prompts[2], /Dígito sugerido: 8\. Iniciar\?/);
   assert.equal(trader.state, "STOPPED");
   assert.equal(sent.length, 0);
   answerSuggestion("s");
   await restarting;
   await trader.sendQueue;
   assert.equal(trader.state, "ANALYZING");
-  assert.equal(trader.target_digit, 3);
-  assert.equal(trader.analysis, analysis);
+  assert.equal(trader.target_digit, 8);
+  assert.equal(trader.analysis.bestDigit, 8);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].subscribe, 1);
   assert.ok(sent[0].ticks);
