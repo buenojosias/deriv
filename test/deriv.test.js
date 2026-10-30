@@ -54,29 +54,110 @@ test("interrompe a autenticação quando a Deriv recusa o OTP", async () => {
   await assert.rejects(authenticatedWsUrl({ token: "x", appId: "123", accountId: "DOT123", fetchImpl: fakeFetch }), /Token inválido/);
 });
 
-test("compra no formato atual e ignora liquidação repetida", async () => {
+test("o próximo tick dispara outra compra antes da resposta da anterior", async () => {
   process.env.DERIV_API_TOKEN = "teste";
   process.env.DERIV_APP_ID = "123";
   process.env.DERIV_ACCOUNT_ID = "DOT123";
+  const { DerivTrader, CONFIG } = require("../trade");
+  const trader = new DerivTrader(7);
+  const sent = [];
+  trader.ws = { readyState: 1, send: (payload, callback) => { sent.push(JSON.parse(payload)); callback(); } };
+  trader.askRestart = () => {};
+  trader.state = "TRADING";
+  trader.currency = "USD";
+  trader.buyContract();
+  await trader.sendQueue;
+  await Promise.resolve();
+  assert.equal(sent[0].buy, "1");
+  assert.equal(sent[0].parameters.underlying_symbol, CONFIG.symbol);
+  assert.equal(sent[0].parameters.symbol, undefined);
+  assert.equal(trader.pending_buys.size, 1);
+
+  trader.handleMessage({ msg_type: "tick", tick: { quote: 100.03, pip_size: 2, epoch: 1 } });
+  await trader.sendQueue;
+  await Promise.resolve();
+  assert.equal(sent.filter((item) => item.buy === "1").length, 2);
+  assert.equal(trader.pending_buys.size, 2);
+  assert.equal(sent[1].req_id, 2);
+
+  trader.handleMessage({ msg_type: "tick", tick: { quote: 100.07, pip_size: 2, epoch: 2 } });
+  assert.equal(trader.state, "DRAINING");
+  assert.equal(sent.filter((item) => item.buy === "1").length, 2);
+
+  trader.handleMessage({ msg_type: "buy", req_id: 2, buy: { contract_id: 102, buy_price: 0.37 } });
+  trader.handleMessage({ msg_type: "buy", req_id: 1, buy: { contract_id: 101, buy_price: 0.35 } });
+  await trader.sendQueue;
+  trader.handleMessage({ msg_type: "proposal_open_contract", proposal_open_contract: { contract_id: 101, status: "lost", is_sold: 1, buy_price: "0.35", profit: "-0.35" } });
+  trader.handleMessage({ msg_type: "proposal_open_contract", proposal_open_contract: { contract_id: 102, status: "won", is_sold: 1, buy_price: "0.37", profit: "2.00" } });
+  assert.equal(trader.state, "STOPPED");
+  assert.equal(trader.contracts_history.length, 2);
+  assert.deepEqual(trader.contracts_history.map((item) => item.attempt), [1, 2]);
+  assert.equal(trader.total_invested, 0.72);
+});
+
+test("a liquidação não dispara compra e mensagens repetidas não duplicam o resultado", async () => {
   const { DerivTrader } = require("../trade");
   const trader = new DerivTrader(7);
   const sent = [];
   trader.ws = { readyState: 1, send: (payload, callback) => { sent.push(JSON.parse(payload)); callback(); } };
+  trader.askRestart = () => {};
   trader.state = "TRADING";
-  trader.current_attempt = 1;
-  trader.buyContract(7, 0.35);
+  trader.currency = "USD";
+  trader.buyContract();
   await trader.sendQueue;
-  assert.equal(sent[0].buy, "1");
-  assert.equal(sent[0].parameters.underlying_symbol, "1HZ25V");
-  assert.equal(sent[0].parameters.symbol, undefined);
-
-  trader.pending_buy = false;
-  trader.active_contract_id = 42;
-  trader.total_invested = 0.35;
+  await Promise.resolve();
+  trader.handleMessage({ msg_type: "buy", req_id: 1, buy: { contract_id: 42, buy_price: 0.35 } });
+  await trader.sendQueue;
   const loss = { contract_id: 42, status: "lost", is_sold: 1, buy_price: "0.35", profit: "-0.35" };
   trader.handleContractUpdate(loss);
   trader.handleContractUpdate(loss);
-  await trader.sendQueue;
   assert.equal(trader.contracts_history.length, 1);
+  assert.equal(sent.filter((item) => item.buy === "1").length, 1);
+  assert.equal(trader.state, "TRADING");
+});
+
+test("considera o tick que chega antes do callback de envio", async () => {
+  const { DerivTrader } = require("../trade");
+  const trader = new DerivTrader(7);
+  const sent = [];
+  let finishFirstSend;
+  trader.ws = { readyState: 1, send: (payload, callback) => {
+    sent.push(JSON.parse(payload));
+    if (sent.length === 1) finishFirstSend = callback;
+    else callback();
+  } };
+  trader.state = "TRADING";
+  trader.currency = "USD";
+  trader.buyContract();
+  await Promise.resolve();
+  assert.equal(sent.length, 1);
+  assert.equal(trader.awaiting_next_tick, true);
+
+  trader.handleMessage({ msg_type: "tick", tick: { quote: 100.03, pip_size: 2, epoch: 1 } });
+  assert.equal(trader.current_attempt, 2);
+  assert.equal(trader.pending_buys.size, 2);
+  assert.equal(sent.filter((item) => item.buy === "1").length, 2);
+  finishFirstSend();
+  await trader.sendQueue;
+  assert.equal(sent.filter((item) => item.buy === "1").length, 2);
+});
+
+test("a contagem inicial leva ao ciclo guiado pelos ticks", async () => {
+  const { DerivTrader } = require("../trade");
+  const trader = new DerivTrader(7);
+  const sent = [];
+  trader.ws = { readyState: 1, send: (payload, callback) => { sent.push(JSON.parse(payload)); callback(); } };
+  trader.currency = "USD";
+  const tick = (digit, epoch) => trader.handleMessage({
+    msg_type: "tick",
+    tick: { quote: 100 + digit, pip_size: 0, epoch },
+  });
+  tick(7, 1);
+  for (let epoch = 2; epoch <= 7; epoch++) tick(3, epoch);
+  await trader.sendQueue;
+  assert.equal(trader.state, "TRADING");
+  assert.equal(sent.filter((item) => item.buy === "1").length, 1);
+  tick(3, 8);
+  await trader.sendQueue;
   assert.equal(sent.filter((item) => item.buy === "1").length, 2);
 });

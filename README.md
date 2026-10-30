@@ -16,6 +16,8 @@ O App ID é individual: entre no [Dashboard de desenvolvedores da Deriv](https:/
 
 O script pede confirmação antes de operar. Cada sequência pode fazer até 20 compras; os valores configurados somam US$ 22,20 se todas forem executadas. Revogue qualquer token que tenha sido salvo no código ou no histórico Git.
 
+Depois da primeira compra, cada tick seguinte decide o ciclo: se o dígito for diferente do alvo, o bot envia outra compra imediatamente, sem aguardar a resposta da anterior. Se for igual, para de enviar compras e espera a liquidação das ordens pendentes para montar o relatório. O limite de 20 compras também interrompe novos envios.
+
 ## Validação
 
 Execute `npm test`. Os testes usam respostas locais e não enviam compras.

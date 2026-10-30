@@ -1,10 +1,9 @@
 const WebSocket = require("ws");
-const readline = require("readline");
+const readline = require("node:readline/promises");
 require("./load_env").loadEnv();
-const { getBestDigit } = require("./deriv_digits"); // módulo anterior
+const { getBestDigit } = require("./deriv_digits");
 const { authenticatedWsUrl, lastDigit } = require("./deriv_api");
 
-// ---------------- CONFIGURAÇÕES ----------------
 const CONFIG = {
   app_id: process.env.DERIV_APP_ID,
   api_token: process.env.DERIV_API_TOKEN,
@@ -15,92 +14,70 @@ const CONFIG = {
   wait_after_target: 6,
 };
 
-// ------------------------------------------------
-
 class DerivTrader {
-  constructor(target_digit) {
-    if (!Number.isInteger(Number(target_digit)) || Number(target_digit) < 0 || Number(target_digit) > 9) {
-      throw new Error("target_digit must be 0-9");
+  constructor(targetDigit) {
+    if (!Number.isInteger(Number(targetDigit)) || Number(targetDigit) < 0 || Number(targetDigit) > 9) {
+      throw new Error("O dígito alvo deve ser um inteiro de 0 a 9");
     }
-    this.ws = null;
-    this.target_digit = Number(target_digit);
-    this.is_authorized = false;
-    this.balance = 0;
-    this.currency = "USD";
-
-    // Estado
-    this.state = "ANALYZING"; // ANALYZING, WAITING, TRADING, STOPPED
-    this.digits_after_target = 0;
-    this.current_attempt = 0;
-    this.total_invested = 0.0;
-    this.current_stake = 0.0;
-    this.contracts_history = [];
-    this.final_payout = 0.0;
-    this.active_contract_id = null;
-    this.settled_contracts = new Set();
-    this.contract_subscription_id = null;
-    this.tick_subscription_id = null;
-    this.pending_buy = false;
-
-    // último tick conhecido
-    this.last_tick_price = null;
-    this.last_tick_digit = null;
-
-    // fila simples para enviar (evita race naive)
-    this.sendQueue = Promise.resolve();
-
-    // controle de reinício
-    this.awaiting_restart = false;
-
-    console.log(`\n🎯 DÍGITO ALVO: ${this.target_digit}`);
-    console.log("=".repeat(60));
-
     if (!CONFIG.api_token || !CONFIG.app_id || !CONFIG.account_id) {
       throw new Error("Defina DERIV_API_TOKEN, DERIV_APP_ID e DERIV_ACCOUNT_ID");
     }
+
+    this.target_digit = Number(targetDigit);
+    this.ws = null;
+    this.state = "ANALYZING"; // ANALYZING, WAITING, TRADING, DRAINING, STOPPED
+    this.currency = null;
+    this.balance = null;
+    this.digits_after_target = 0;
+    this.current_attempt = 0;
+    this.total_invested = 0;
+    this.contracts_history = [];
+    this.pending_buys = new Map(); // req_id -> { attempt, stake }
+    this.open_contracts = new Map(); // contract_id -> { attempt, stake, subscriptionId }
+    this.settled_contracts = new Set();
+    this.next_request_id = 1;
+    this.tick_subscription_id = null;
+    this.awaiting_next_tick = false;
+    this.last_tick_key = null;
+    this.sendQueue = Promise.resolve(); // acompanha envios pendentes nos testes
+    this.awaiting_restart = false;
+    console.log(`\n🎯 DÍGITO ALVO: ${this.target_digit}`);
   }
 
-  // envia payload de forma "sequencial" evitando possíveis races (sendQueue)
-  safeSend(payload) {
-    const raw = JSON.stringify(payload);
-    // chain promise so sends happen in order
-    this.sendQueue = this.sendQueue
-      .then(() => {
-        return new Promise((resolve) => {
-          try {
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-              this.ws.send(raw, (err) => {
-                if (err) {
-                  console.error("⚠️ Erro ao enviar payload:", err);
-                  this.state = "STOPPED";
-                }
-                resolve();
-              });
-            } else {
-              console.error("⚠️ WebSocket fechado; operação interrompida");
-              this.state = "STOPPED";
-              resolve();
-            }
-          } catch (e) {
-            console.error("⚠️ Erro ao enviar payload:", e);
-            this.state = "STOPPED";
-            resolve();
+  // ws.send é chamado no próprio evento do tick, sem aguardar outros envios.
+  safeSend(payload, onSent) {
+    const operation = new Promise((resolve) => {
+      if (payload.buy && this.state !== "TRADING") {
+        resolve(false);
+        return;
+      }
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        console.error("WebSocket fechado; envio cancelado");
+        resolve(false);
+        return;
+      }
+      try {
+        let failedSynchronously = false;
+        this.ws.send(JSON.stringify(payload), (error) => {
+          if (error) {
+            failedSynchronously = true;
+            console.error("Erro ao enviar mensagem:", error.message);
           }
+          resolve(!error);
         });
-      })
-      .catch((_) => {}); // evitar rejection cascade
-  }
-
-  getLastDigit(price, pipSize) {
-    return lastDigit(price, pipSize);
+        if (onSent && !failedSynchronously) onSent();
+      } catch (error) {
+        console.error("Erro ao enviar mensagem:", error.message);
+        resolve(false);
+      }
+    });
+    this.sendQueue = Promise.all([this.sendQueue, operation]).then(() => undefined);
+    return operation;
   }
 
   calculateStake(attempt) {
-    // recursivo conforme original: attempt 1 -> initial_stake
-    if (attempt === 1) return CONFIG.initial_stake;
-    const prev = this.calculateStake(attempt - 1);
-    // round to 2 decimals
-    return Math.round((prev + attempt / 100) * 100) / 100;
+    // Mesma progressão de valores usada anteriormente.
+    return Math.round((CONFIG.initial_stake + ((attempt * (attempt + 1)) / 2 - 1) / 100) * 100) / 100;
   }
 
   async connect() {
@@ -110,174 +87,143 @@ class DerivTrader {
       accountId: CONFIG.account_id,
     });
     this.ws = new WebSocket(wsUrl);
-
     this.ws.on("open", () => {
-      console.log("✅ Conectado à Deriv API");
-      this.safeSend({ balance: 1 });
+      console.log("✅ Conectado à conta Options da Deriv");
+      this.safeSend({ balance: 1 }).then((sent) => {
+        if (!sent) this.stopWithError("Não foi possível consultar o saldo");
+      });
     });
-
-    this.ws.on("message", (message) => {
+    this.ws.on("message", (raw) => {
       let response;
       try {
-        response = JSON.parse(message);
-      } catch (e) {
-        console.error("Resposta WebSocket inválida:", e.message);
+        response = JSON.parse(raw);
+      } catch (error) {
+        this.stopWithError(`Resposta inválida: ${error.message}`);
         return;
       }
-      if (response.error) {
-        console.error("❌ Erro da Deriv:", response.error.message || JSON.stringify(response.error));
-        if (response.msg_type === "buy" || response.msg_type === "proposal_open_contract" || response.msg_type === "balance" || response.msg_type === "tick") {
-          this.pending_buy = false;
-          this.state = "STOPPED";
-          this.ws.close();
-        }
-        return;
-      }
-      const msg_type = response.msg_type;
-      if (msg_type === "balance") {
-        const balance = response.balance || {};
-        if (balance.balance == null || !balance.currency) {
-          console.error("Resposta de saldo incompleta");
-          this.state = "STOPPED";
-          return;
-        }
-        this.balance = balance.balance !== undefined ? Number(balance.balance) : this.balance;
-        this.currency = balance.currency || this.currency;
-        this.is_authorized = true;
-        console.log(
-          `✅ Conta conectada | Saldo: ${this.balance} ${this.currency}\n`
-        );
-        this.subscribeTicks();
-        return;
-      }
-
-      if (msg_type === "tick") {
-        const tick = response.tick;
-        if (!tick) return;
-        const price = tick.quote;
-        if (price == null) return;
-        let digit;
-        try { digit = this.getLastDigit(price, tick.pip_size); } catch (error) {
-          console.error(error.message);
-          this.state = "STOPPED";
-          return;
-        }
-        if (response.subscription?.id) this.tick_subscription_id = response.subscription.id;
-        this.last_tick_price = price;
-        this.last_tick_digit = digit;
-
-        if (this.state === "TRADING" || this.state === "STOPPED") return;
-
-        const epoch = tick.epoch || Math.floor(Date.now() / 1000);
-        const timeStr = new Date(epoch * 1000).toTimeString().split(" ")[0];
-        process.stdout.write(`🎲 ${timeStr} | Dígito: ${digit}`);
-
-        if (this.state === "ANALYZING") {
-          if (digit === this.target_digit) {
-            console.log(" ← 🎯 Dígito alvo apareceu! Iniciando contagem...");
-            this.state = "WAITING";
-            this.digits_after_target = 0;
-          } else {
-            console.log();
-          }
-          return;
-        }
-
-        if (this.state === "WAITING") {
-          if (digit !== this.target_digit) {
-            this.digits_after_target += 1;
-            console.log(
-              ` | Contagem: ${this.digits_after_target}/${CONFIG.wait_after_target}`
-            );
-            if (this.digits_after_target >= CONFIG.wait_after_target) {
-              console.log("\n" + "=".repeat(60));
-              console.log("🚀 INICIANDO OPERAÇÕES!");
-              console.log("=".repeat(60));
-              this.state = "TRADING";
-              this.current_attempt = 1;
-              const stake = this.calculateStake(this.current_attempt);
-              this.buyContract(this.target_digit, stake);
-            }
-          } else {
-            console.log(
-              " ← Dígito alvo apareceu novamente, reiniciando contagem"
-            );
-            this.digits_after_target = 0;
-          }
-          return;
-        }
-        return;
-      }
-
-      if (msg_type === "buy") {
-        const buy_data = response.buy;
-        if (!this.pending_buy) return;
-        if (!buy_data?.contract_id) {
-          console.error("Resposta de compra incompleta; operações interrompidas");
-          this.state = "STOPPED";
-          this.pending_buy = false;
-          return;
-        }
-        this.pending_buy = false;
-        const contract_id = buy_data.contract_id;
-        this.active_contract_id = contract_id;
-        const buy_price = buy_data.buy_price != null && Number.isFinite(Number(buy_data.buy_price))
-          ? Number(buy_data.buy_price) : this.current_stake;
-        this.current_stake = buy_price;
-        this.total_invested += buy_price;
-        console.log(
-          `\n✅ Contrato comprado! ID: ${contract_id} | Valor pago: $${buy_price.toFixed(
-            2
-          )}`
-        );
-        console.log("⏳ Aguardando resultado do contrato...\n");
-        const req = {
-          proposal_open_contract: 1,
-          contract_id: contract_id,
-          subscribe: 1,
-        };
-        this.safeSend(req);
-        return;
-      }
-
-      if (msg_type === "proposal_open_contract") {
-        const contract = response.proposal_open_contract;
-        if (!contract || String(contract.contract_id) !== String(this.active_contract_id)) return;
-        if (response.subscription?.id) this.contract_subscription_id = response.subscription.id;
-        this.handleContractUpdate(contract);
-        return;
-      }
-
-      // outras mensagens ignoradas silenciosamente
+      this.handleMessage(response);
     });
-
-    this.ws.on("error", (err) => {
-      console.error(
-        "❌ Erro no WebSocket:",
-        err && err.message ? err.message : err
-      );
+    this.ws.on("error", (error) => this.stopWithError(`WebSocket: ${error.message}`));
+    this.ws.on("close", () => {
+      if (this.state !== "STOPPED") {
+        this.stopWithError("Conexão encerrada antes da conclusão do ciclo");
+      }
+      console.log("🔌 Conexão encerrada");
     });
+  }
 
-    this.ws.on("close", (code, reason) => {
-      console.log(
-        "\n🔌 Conexão encerrada",
-        code ? `código: ${code}` : "",
-        reason ? `motivo: ${reason}` : ""
-      );
-      // se necessário, aqui você poderia reconectar
-    });
+  handleMessage(response) {
+    if (response.error) {
+      this.handleApiError(response);
+      return;
+    }
+    if (response.msg_type === "balance") {
+      const { balance, currency } = response.balance || {};
+      if (!Number.isFinite(Number(balance)) || !currency) {
+        this.stopWithError("Resposta de saldo incompleta");
+        return;
+      }
+      this.balance = Number(balance);
+      this.currency = currency;
+      console.log(`✅ Conta conectada | Saldo: ${this.balance} ${this.currency}`);
+      if (this.state === "ANALYZING" && !this.tick_subscription_id) this.subscribeTicks();
+      return;
+    }
+    if (response.msg_type === "tick") {
+      this.handleTick(response);
+      return;
+    }
+    if (response.msg_type === "buy") {
+      this.handleBuy(response);
+      return;
+    }
+    if (response.msg_type === "proposal_open_contract") {
+      this.handleContractUpdate(response.proposal_open_contract, response.subscription?.id);
+    }
+  }
+
+  handleApiError(response) {
+    const message = response.error?.message || JSON.stringify(response.error);
+    console.error(`❌ Erro da Deriv (${response.msg_type || "desconhecido"}): ${message}`);
+    if (response.msg_type === "buy") {
+      if (response.req_id != null) this.pending_buys.delete(response.req_id);
+      this.stopCycle("compra recusada");
+      return;
+    }
+    if (response.msg_type === "proposal_open_contract") {
+      this.stopWithError("Não foi possível acompanhar um contrato comprado");
+      return;
+    }
+    if (response.msg_type === "forget") return;
+    this.stopWithError("Falha na comunicação com a Deriv");
   }
 
   subscribeTicks() {
-    const req = { ticks: CONFIG.symbol, subscribe: 1 };
-    this.safeSend(req);
+    this.safeSend({ ticks: CONFIG.symbol, subscribe: 1 }).then((sent) => {
+      if (!sent) this.stopWithError("Não foi possível assinar os ticks");
+    });
   }
 
-  buyContract(digit, stake) {
-    if (this.pending_buy || this.active_contract_id || this.state !== "TRADING") return;
+  handleTick(response) {
+    const tick = response.tick;
+    if (tick?.quote == null) return;
+    let digit;
+    try {
+      digit = lastDigit(tick.quote, tick.pip_size);
+    } catch (error) {
+      this.stopWithError(error.message);
+      return;
+    }
+    if (response.subscription?.id) this.tick_subscription_id = response.subscription.id;
+    const key = tick.epoch == null ? null : `${tick.epoch}:${tick.quote}`;
+    if (key && key === this.last_tick_key) return;
+    this.last_tick_key = key;
+
+    if (this.state === "TRADING") {
+      if (!this.awaiting_next_tick) return;
+      this.awaiting_next_tick = false;
+      console.log(`🎲 Próximo dígito: ${digit}`);
+      if (digit === this.target_digit) {
+        this.stopCycle("dígito alvo observado");
+      } else if (this.current_attempt >= CONFIG.max_attempts) {
+        this.stopCycle("limite de tentativas atingido");
+      } else {
+        this.buyContract();
+      }
+      return;
+    }
+
+    if (this.state === "ANALYZING") {
+      if (digit === this.target_digit) {
+        this.state = "WAITING";
+        this.digits_after_target = 0;
+        console.log("🎯 Dígito alvo apareceu; iniciando contagem");
+      }
+      return;
+    }
+    if (this.state === "WAITING") {
+      this.digits_after_target = digit === this.target_digit ? 0 : this.digits_after_target + 1;
+      console.log(`🎲 Dígito: ${digit} | Contagem: ${this.digits_after_target}/${CONFIG.wait_after_target}`);
+      if (this.digits_after_target >= CONFIG.wait_after_target) {
+        this.state = "TRADING";
+        console.log("🚀 Iniciando operações");
+        this.buyContract();
+      }
+    }
+  }
+
+  buyContract() {
+    if (this.state !== "TRADING" || this.current_attempt >= CONFIG.max_attempts) return;
+    const attempt = ++this.current_attempt;
+    const stake = this.calculateStake(attempt);
+    const reqId = this.next_request_id++;
+    this.pending_buys.set(reqId, { attempt, stake });
+    this.awaiting_next_tick = false;
+    console.log(`💵 Entrada #${attempt}/${CONFIG.max_attempts}: ${stake.toFixed(2)} ${this.currency}`);
     const request = {
       buy: "1",
       price: stake,
+      req_id: reqId,
       parameters: {
         contract_type: "DIGITMATCH",
         underlying_symbol: CONFIG.symbol,
@@ -285,258 +231,168 @@ class DerivTrader {
         duration_unit: "t",
         basis: "stake",
         amount: stake,
-        barrier: String(digit),
+        barrier: String(this.target_digit),
         currency: this.currency,
       },
     };
-    this.pending_buy = true;
-    this.current_stake = stake;
-    console.log(`\n💵 ENTRADA #${this.current_attempt}:`);
-    console.log(`   Valor desta entrada: $${stake.toFixed(2)}`);
-    console.log(
-      `   Total investido até agora: $${this.total_invested.toFixed(2)}`
-    );
-    console.log(`📤 Enviando aposta no dígito ${digit}...`);
-    this.safeSend(request);
+    this.safeSend(request, () => {
+      if (this.state === "TRADING") this.awaiting_next_tick = true;
+    }).then((sent) => {
+      if (!sent) {
+        this.pending_buys.delete(reqId);
+        this.stopCycle("falha ao enviar compra");
+      }
+    });
   }
 
-  handleContractUpdate(contract) {
-    const status = contract.status;
-    const contract_id = String(contract.contract_id);
-
-    if (status === "open" || (!contract.is_sold && status !== "won" && status !== "lost") || this.settled_contracts.has(contract_id)) return;
-    this.settled_contracts.add(contract_id);
-    this.active_contract_id = null;
-    if (this.contract_subscription_id) {
-      this.safeSend({ forget: this.contract_subscription_id });
-      this.contract_subscription_id = null;
-    }
-
-    const profit = Number(contract.profit);
-    const buy_price = Number(contract.buy_price);
-    if (contract.profit == null || contract.buy_price == null ||
-        !Number.isFinite(profit) || !Number.isFinite(buy_price)) {
-      console.error("Resultado de contrato incompleto; operações interrompidas");
-      this.state = "STOPPED";
+  handleBuy(response) {
+    const pending = this.pending_buys.get(response.req_id);
+    if (!pending) {
+      this.stopWithError("Resposta de compra sem req_id conhecido");
       return;
     }
-    this.total_invested += buy_price - this.current_stake;
-    this.current_stake = buy_price;
-
-    const payout_received = buy_price + profit;
-
-    this.contracts_history.push({
-      attempt: this.current_attempt,
-      stake: this.current_stake,
-      profit,
-      payout: payout_received,
+    this.pending_buys.delete(response.req_id);
+    const buy = response.buy;
+    if (!buy?.contract_id) {
+      this.stopWithError("Resposta de compra sem ID do contrato");
+      return;
+    }
+    const price = buy.buy_price != null && Number.isFinite(Number(buy.buy_price))
+      ? Number(buy.buy_price) : pending.stake;
+    const id = String(buy.contract_id);
+    this.total_invested += price;
+    this.open_contracts.set(id, { ...pending, stake: price, subscriptionId: null });
+    console.log(`✅ Compra #${pending.attempt} confirmada | Contrato ${id} | Pago: ${price.toFixed(2)} ${this.currency}`);
+    this.safeSend({ proposal_open_contract: 1, contract_id: buy.contract_id, subscribe: 1 }).then((sent) => {
+      if (!sent) this.stopWithError(`Não foi possível acompanhar o contrato ${id}`);
     });
+    this.maybeFinalize();
+  }
 
-    if (profit > 0) {
-      this.final_payout = payout_received;
-      console.log("\n" + "=".repeat(60));
-      console.log(`✅ GANHOU! Prêmio: $${payout_received.toFixed(2)}`);
-      console.log("=".repeat(60));
-      // pede ao servidor "esquecer" streams ticks
+  handleContractUpdate(contract, subscriptionId) {
+    if (!contract?.contract_id) return;
+    const id = String(contract.contract_id);
+    const record = this.open_contracts.get(id);
+    if (!record || this.settled_contracts.has(id)) return;
+    if (subscriptionId) record.subscriptionId = subscriptionId;
+    if (contract.status === "open" || (!contract.is_sold && !["won", "lost"].includes(contract.status))) return;
+    const profit = Number(contract.profit);
+    const buyPrice = Number(contract.buy_price);
+    if (contract.profit == null || contract.buy_price == null ||
+        !Number.isFinite(profit) || !Number.isFinite(buyPrice)) {
+      this.stopWithError(`Resultado incompleto do contrato ${id}`);
+      return;
+    }
+    this.settled_contracts.add(id);
+    this.open_contracts.delete(id);
+    this.total_invested += buyPrice - record.stake;
+    const payout = buyPrice + profit;
+    this.contracts_history.push({ attempt: record.attempt, stake: buyPrice, profit, payout });
+    console.log(`${profit > 0 ? "✅" : "❌"} Contrato #${record.attempt} ${contract.status}: ${profit.toFixed(2)} ${this.currency}`);
+    if (record.subscriptionId) this.safeSend({ forget: record.subscriptionId });
+    this.maybeFinalize();
+  }
+
+  stopCycle(reason) {
+    if (this.state !== "TRADING" && this.state !== "DRAINING") return;
+    if (this.state === "TRADING") {
+      this.state = "DRAINING";
+      this.awaiting_next_tick = false;
+      console.log(`🛑 Ciclo encerrado: ${reason}`);
       if (this.tick_subscription_id) this.safeSend({ forget: this.tick_subscription_id });
       this.tick_subscription_id = null;
-      this.generateFinalReport();
-      this.state = "STOPPED";
-      this.awaiting_restart = true;
-      // pergunta se reiniciar (não bloqueia o ws)
-      this.askRestart();
-      return;
     }
+    this.maybeFinalize();
+  }
 
-    console.log("\n" + "=".repeat(60));
-    console.log(`❌ PERDEU! Perda: $${Math.abs(profit).toFixed(2)}`);
+  maybeFinalize() {
+    if (this.state !== "DRAINING" || this.pending_buys.size || this.open_contracts.size) return;
+    this.state = "STOPPED";
+    this.generateFinalReport();
+    this.awaiting_restart = true;
+    this.askRestart();
+  }
 
-    console.log(`🎲 Cotação de saída: ${contract.exit_spot ?? "(não informada)"}`);
-
-    console.log(
-      `📊 Total investido até agora: $${this.total_invested.toFixed(2)}`
-    );
-
-    if (this.current_attempt < CONFIG.max_attempts) {
-      this.current_attempt += 1;
-      const stake = this.calculateStake(this.current_attempt);
-      console.log(
-        `🔄 Próxima tentativa: ${this.current_attempt}/${CONFIG.max_attempts}`
-      );
-      console.log("=".repeat(60));
-      this.buyContract(this.target_digit, stake);
-    } else {
-      console.log(`🛑 Limite de tentativas atingido (${CONFIG.max_attempts})`);
-      console.log(`💸 Total perdido: $${this.total_invested.toFixed(2)}`);
-      console.log("=".repeat(60));
-      this.state = "STOPPED";
-      try {
-        if (this.ws) this.ws.close();
-      } catch (e) {}
-    }
+  stopWithError(message) {
+    if (this.state === "STOPPED") return;
+    console.error(`❌ ${message}`);
+    this.state = "STOPPED";
+    this.awaiting_next_tick = false;
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.close();
   }
 
   generateFinalReport() {
-    const total_payouts = this.contracts_history.reduce(
-      (s, h) => s + (h.payout || 0),
-      0
-    );
-    const net_profit = total_payouts - this.total_invested;
-
-    console.log("\n" + "╔" + "=".repeat(58) + "╗");
-    console.log(
-      "║" + " ".repeat(15) + "📊 RELATÓRIO FINAL" + " ".repeat(24) + "║"
-    );
-    console.log("╠" + "=".repeat(58) + "╣");
-    console.log(`║  🎯 Dígito Alvo: ${this.target_digit}`);
-    console.log(`║  🔢 Tentativas: ${this.current_attempt}`);
-    console.log("╠" + "=".repeat(58) + "╣");
-    console.log(`║  💰 Total Investido: $${this.total_invested.toFixed(2)}`);
-    console.log(`║  🏆 Payout Recebido: $${total_payouts.toFixed(2)}`);
-    console.log("╠" + "=".repeat(58) + "╣");
-    if (net_profit > 0) {
-      console.log(`║  ✅ LUCRO FINAL: $${net_profit.toFixed(2)}`);
-    } else {
-      console.log(`║  ❌ PREJUÍZO FINAL: $${Math.abs(net_profit).toFixed(2)}`);
-    }
-    console.log("╚" + "=".repeat(58) + "╝\n");
+    const payouts = this.contracts_history.reduce((sum, item) => sum + item.payout, 0);
+    const profit = payouts - this.total_invested;
+    console.log("\n📊 RELATÓRIO FINAL");
+    console.log(`Dígito alvo: ${this.target_digit}`);
+    console.log(`Ordens enviadas: ${this.current_attempt}`);
+    console.log(`Contratos liquidados: ${this.contracts_history.length}`);
+    console.log(`Total investido: ${this.total_invested.toFixed(2)} ${this.currency}`);
+    console.log(`Total recebido: ${payouts.toFixed(2)} ${this.currency}`);
+    console.log(`Resultado líquido: ${profit.toFixed(2)} ${this.currency}\n`);
   }
 
   async askRestart() {
-    // pequena espera para não conflitar com prints
-    await new Promise((r) => setTimeout(r, 1500));
     if (!this.awaiting_restart) return;
-
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-    rl.question(
-      "\n❓ Deseja iniciar uma nova operação? (s/n): ",
-      async (answer) => {
-        rl.close();
-        const resp = String(answer || "")
-          .trim()
-          .toLowerCase();
-        if (resp === "s") {
-          console.log("\n🔄 Reiniciando análise...\n");
-          this.state = "ANALYZING";
-          this.digits_after_target = 0;
-          this.current_attempt = 0;
-          this.total_invested = 0.0;
-          this.current_stake = 0.0;
-          this.contracts_history = [];
-          this.final_payout = 0.0;
-          this.settled_contracts.clear();
-          this.awaiting_restart = false;
-          // Atualiza o alvo antes de voltar a contar ticks.
-          try {
-            const new_digit = await getBestDigit(true);
-            if (new_digit !== null && new_digit !== undefined) {
-              this.target_digit = new_digit;
-              console.log(`\n🎯 NOVO DÍGITO ALVO: ${new_digit}`);
-              console.log("=".repeat(60) + "\n");
-            }
-          } catch (e) {
-            // mantém dígito atual se falhar
-          }
-          this.subscribeTicks();
-        } else {
-          console.log("\n👋 Encerrando operações...");
-          try {
-            if (this.ws) this.ws.close();
-          } catch (e) {}
-        }
-      }
-    );
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = (await rl.question("Iniciar novo ciclo? (s/n): ")).trim().toLowerCase();
+    rl.close();
+    if (answer !== "s") {
+      this.ws?.close();
+      return;
+    }
+    this.awaiting_restart = false;
+    try {
+      const digit = await getBestDigit(true);
+      if (digit == null) throw new Error("Histórico vazio");
+      this.target_digit = digit;
+    } catch (error) {
+      this.stopWithError(`Falha na nova análise: ${error.message}`);
+      return;
+    }
+    this.state = "ANALYZING";
+    this.digits_after_target = 0;
+    this.current_attempt = 0;
+    this.total_invested = 0;
+    this.contracts_history = [];
+    this.pending_buys.clear();
+    this.open_contracts.clear();
+    this.settled_contracts.clear();
+    this.last_tick_key = null;
+    this.subscribeTicks();
+    console.log(`🎯 Novo dígito alvo: ${this.target_digit}`);
   }
 }
 
-// função auxiliar para obter melhor dígito (chama módulo graph)
-async function get_best_digit() {
-  console.log("=".repeat(60));
-  console.log("📊 ANALISANDO MERCADO...");
-  console.log("=".repeat(60));
-  const best_digit = await getBestDigit(true);
-  if (best_digit == null) throw new Error("Histórico de ticks vazio");
-  return best_digit;
+async function main() {
+  if (!CONFIG.api_token || !CONFIG.app_id || !CONFIG.account_id) {
+    throw new Error("Defina DERIV_API_TOKEN, DERIV_APP_ID e DERIV_ACCOUNT_ID");
+  }
+  console.log("🤖 DERIV TRADING BOT - DÍGITO COMBINA");
+  const suggested = await getBestDigit(true);
+  if (suggested == null) throw new Error("Histórico de ticks vazio");
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (await rl.question(`Dígito sugerido: ${suggested}. Iniciar? (s/n): `)).trim().toLowerCase();
+  let digit = suggested;
+  if (answer !== "s") {
+    const manual = (await rl.question("Escolher outro dígito? (s/n): ")).trim().toLowerCase();
+    if (manual !== "s") {
+      rl.close();
+      return;
+    }
+    digit = Number(await rl.question("Dígito (0-9): "));
+  }
+  rl.close();
+  const trader = new DerivTrader(digit);
+  await trader.connect();
 }
 
-// se executado diretamente
 if (require.main === module) {
-  (async () => {
-    if (!CONFIG.api_token || !CONFIG.app_id || !CONFIG.account_id) {
-      console.error("Defina DERIV_API_TOKEN, DERIV_APP_ID e DERIV_ACCOUNT_ID");
-      process.exitCode = 1;
-      return;
-    }
-    console.log("\n" + "=".repeat(60));
-    console.log("🤖 DERIV TRADING BOT - DÍGITO COMBINA");
-    console.log("=".repeat(60));
-
-    let best_digit;
-    try { best_digit = await get_best_digit(); } catch (error) {
-      console.error("Erro na análise:", error.message);
-      process.exitCode = 1;
-      return;
-    }
-
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-
-    rl.question(
-      `\n✅ Dígito sugerido: ${best_digit} | Iniciar operação? (s/n): `,
-      async (answer) => {
-        const resp = String(answer || "")
-          .trim()
-          .toLowerCase();
-        if (resp === "s") {
-          rl.close();
-          try {
-            const trader = new DerivTrader(best_digit);
-            await trader.connect();
-          } catch (err) {
-            console.error("Erro ao conectar:", err);
-          }
-        } else {
-          rl.question(
-            "\nDeseja escolher outro dígito manualmente? (s/n): ",
-            async (ans2) => {
-              const r2 = String(ans2 || "")
-                .trim()
-                .toLowerCase();
-              if (r2 === "s") {
-                rl.question("Digite o dígito desejado (0-9): ", async (d) => {
-                  const manual_digit = Number(d);
-                  rl.close();
-                  if (
-                    Number.isInteger(manual_digit) &&
-                    manual_digit >= 0 &&
-                    manual_digit <= 9
-                  ) {
-                    try {
-                      const trader = new DerivTrader(manual_digit);
-                      await trader.connect();
-                    } catch (err) {
-                      console.error("Erro ao conectar:", err);
-                    }
-                  } else {
-                    console.log("Dígito inválido. Encerrando...");
-                  }
-                });
-              } else {
-                rl.close();
-                console.log("\n👋 Encerrando...");
-              }
-            }
-          );
-        }
-      }
-    );
-  })();
+  main().catch((error) => {
+    console.error("Erro:", error.message);
+    process.exitCode = 1;
+  });
 }
 
-// exporta a classe caso queira usar programaticamente
-module.exports = { DerivTrader };
+module.exports = { DerivTrader, CONFIG };
