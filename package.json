@@ -2,6 +2,7 @@
   "scripts": {
     "tick": "node script.js",
     "analyze": "node deriv_digits.js",
+    "analise": "node analise.js",
     "trade": "node trade.js",
     "test": "node --test --test-isolation=none"
   },

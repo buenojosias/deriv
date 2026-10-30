@@ -69,6 +69,7 @@ class DigitAnalyzer {
       })),
       frequency: this.getStatistics(),
       bestDigit: this.getBestDigitInfo()?.digit ?? null,
+      lastTickEpoch: this.ticksData.at(-1)?.time.getTime() / 1000 ?? null,
     };
   }
 

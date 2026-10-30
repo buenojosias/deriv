@@ -13,7 +13,7 @@ const CONFIG = {
   symbol: process.env.DERIV_SYMBOL || "1HZ25V",
   initial_stake: 0.35,
   max_attempts: 20,
-  wait_after_target: 6,
+  wait_after_target: 0,
 };
 
 async function confirmAnalysis(initialAnalysis, question, analyze) {
