@@ -1,27 +1,25 @@
-// deriv_trader.js
-// Requer: npm install ws
-// Assume: existe ./deriv_digits.js exportando getBestDigit(display)
-
 const WebSocket = require("ws");
 const readline = require("readline");
+require("./load_env").loadEnv();
 const { getBestDigit } = require("./deriv_digits"); // módulo anterior
+const { authenticatedWsUrl, lastDigit } = require("./deriv_api");
 
 // ---------------- CONFIGURAÇÕES ----------------
 const CONFIG = {
-  app_id: 1089,
-  api_token: process.env.DERIV_API_TOKEN || "pat_6b14059c618cf434a7f2e11a3ae014aed10c1f17828b46b69a4d6e141a4e2bd0", // recomenda usar VAR DE AMBIENTE
-  symbol: "R_25",
+  app_id: process.env.DERIV_APP_ID,
+  api_token: process.env.DERIV_API_TOKEN,
+  account_id: process.env.DERIV_ACCOUNT_ID,
+  symbol: process.env.DERIV_SYMBOL || "1HZ25V",
   initial_stake: 0.35,
   max_attempts: 20,
   wait_after_target: 6,
 };
 
-const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${CONFIG.app_id}`;
 // ------------------------------------------------
 
 class DerivTrader {
   constructor(target_digit) {
-    if (target_digit < 0 || target_digit > 9) {
+    if (!Number.isInteger(Number(target_digit)) || Number(target_digit) < 0 || Number(target_digit) > 9) {
       throw new Error("target_digit must be 0-9");
     }
     this.ws = null;
@@ -38,6 +36,11 @@ class DerivTrader {
     this.current_stake = 0.0;
     this.contracts_history = [];
     this.final_payout = 0.0;
+    this.active_contract_id = null;
+    this.settled_contracts = new Set();
+    this.contract_subscription_id = null;
+    this.tick_subscription_id = null;
+    this.pending_buy = false;
 
     // último tick conhecido
     this.last_tick_price = null;
@@ -52,10 +55,8 @@ class DerivTrader {
     console.log(`\n🎯 DÍGITO ALVO: ${this.target_digit}`);
     console.log("=".repeat(60));
 
-    if (!CONFIG.api_token || CONFIG.api_token === "SEU_TOKEN_AQUI") {
-      console.warn(
-        "⚠️ Aviso: token da API não definido ou é o placeholder. Use DERIV_API_TOKEN ou ajuste CONFIG."
-      );
+    if (!CONFIG.api_token || !CONFIG.app_id || !CONFIG.account_id) {
+      throw new Error("Defina DERIV_API_TOKEN, DERIV_APP_ID e DERIV_ACCOUNT_ID");
     }
   }
 
@@ -69,15 +70,20 @@ class DerivTrader {
           try {
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {
               this.ws.send(raw, (err) => {
-                if (err) console.warn("⚠️ Erro ao enviar payload:", err);
+                if (err) {
+                  console.error("⚠️ Erro ao enviar payload:", err);
+                  this.state = "STOPPED";
+                }
                 resolve();
               });
             } else {
-              // se ws não aberto, simplesmente resolve (não vamos bloquear)
+              console.error("⚠️ WebSocket fechado; operação interrompida");
+              this.state = "STOPPED";
               resolve();
             }
           } catch (e) {
-            console.warn("⚠️ Erro ao enviar payload:", e);
+            console.error("⚠️ Erro ao enviar payload:", e);
+            this.state = "STOPPED";
             resolve();
           }
         });
@@ -85,10 +91,8 @@ class DerivTrader {
       .catch((_) => {}); // evitar rejection cascade
   }
 
-  getLastDigit(price) {
-    const priceStr = String(price).replace(".", "");
-    if (!priceStr) return 0;
-    return parseInt(priceStr.charAt(priceStr.length - 1), 10);
+  getLastDigit(price, pipSize) {
+    return lastDigit(price, pipSize);
   }
 
   calculateStake(attempt) {
@@ -99,13 +103,17 @@ class DerivTrader {
     return Math.round((prev + attempt / 100) * 100) / 100;
   }
 
-  connect() {
+  async connect() {
+    const wsUrl = await authenticatedWsUrl({
+      token: CONFIG.api_token,
+      appId: CONFIG.app_id,
+      accountId: CONFIG.account_id,
+    });
     this.ws = new WebSocket(wsUrl);
 
     this.ws.on("open", () => {
       console.log("✅ Conectado à Deriv API");
-      const req = { authorize: CONFIG.api_token };
-      this.safeSend(req);
+      this.safeSend({ balance: 1 });
     });
 
     this.ws.on("message", (message) => {
@@ -113,16 +121,31 @@ class DerivTrader {
       try {
         response = JSON.parse(message);
       } catch (e) {
+        console.error("Resposta WebSocket inválida:", e.message);
+        return;
+      }
+      if (response.error) {
+        console.error("❌ Erro da Deriv:", response.error.message || JSON.stringify(response.error));
+        if (response.msg_type === "buy" || response.msg_type === "proposal_open_contract" || response.msg_type === "balance" || response.msg_type === "tick") {
+          this.pending_buy = false;
+          this.state = "STOPPED";
+          this.ws.close();
+        }
         return;
       }
       const msg_type = response.msg_type;
-      if (msg_type === "authorize") {
-        const auth = response.authorize || {};
+      if (msg_type === "balance") {
+        const balance = response.balance || {};
+        if (balance.balance == null || !balance.currency) {
+          console.error("Resposta de saldo incompleta");
+          this.state = "STOPPED";
+          return;
+        }
+        this.balance = balance.balance !== undefined ? Number(balance.balance) : this.balance;
+        this.currency = balance.currency || this.currency;
         this.is_authorized = true;
-        this.balance = auth.balance !== undefined ? auth.balance : this.balance;
-        this.currency = auth.currency || this.currency;
         console.log(
-          `✅ Autorizado | Saldo: ${this.balance} ${this.currency}\n`
+          `✅ Conta conectada | Saldo: ${this.balance} ${this.currency}\n`
         );
         this.subscribeTicks();
         return;
@@ -132,7 +155,14 @@ class DerivTrader {
         const tick = response.tick;
         if (!tick) return;
         const price = tick.quote;
-        const digit = this.getLastDigit(price);
+        if (price == null) return;
+        let digit;
+        try { digit = this.getLastDigit(price, tick.pip_size); } catch (error) {
+          console.error(error.message);
+          this.state = "STOPPED";
+          return;
+        }
+        if (response.subscription?.id) this.tick_subscription_id = response.subscription.id;
         this.last_tick_price = price;
         this.last_tick_digit = digit;
 
@@ -166,7 +196,6 @@ class DerivTrader {
               this.state = "TRADING";
               this.current_attempt = 1;
               const stake = this.calculateStake(this.current_attempt);
-              this.total_invested += stake;
               this.buyContract(this.target_digit, stake);
             }
           } else {
@@ -181,9 +210,21 @@ class DerivTrader {
       }
 
       if (msg_type === "buy") {
-        const buy_data = response.buy || {};
+        const buy_data = response.buy;
+        if (!this.pending_buy) return;
+        if (!buy_data?.contract_id) {
+          console.error("Resposta de compra incompleta; operações interrompidas");
+          this.state = "STOPPED";
+          this.pending_buy = false;
+          return;
+        }
+        this.pending_buy = false;
         const contract_id = buy_data.contract_id;
-        const buy_price = parseFloat(buy_data.buy_price || 0) || 0.0;
+        this.active_contract_id = contract_id;
+        const buy_price = buy_data.buy_price != null && Number.isFinite(Number(buy_data.buy_price))
+          ? Number(buy_data.buy_price) : this.current_stake;
+        this.current_stake = buy_price;
+        this.total_invested += buy_price;
         console.log(
           `\n✅ Contrato comprado! ID: ${contract_id} | Valor pago: $${buy_price.toFixed(
             2
@@ -200,16 +241,11 @@ class DerivTrader {
       }
 
       if (msg_type === "proposal_open_contract") {
-        const contract = response.proposal_open_contract || {};
+        const contract = response.proposal_open_contract;
+        if (!contract || String(contract.contract_id) !== String(this.active_contract_id)) return;
+        if (response.subscription?.id) this.contract_subscription_id = response.subscription.id;
         this.handleContractUpdate(contract);
         return;
-      }
-
-      if (response.error) {
-        console.error(
-          "❌ Erro:",
-          response.error.message || JSON.stringify(response.error)
-        );
       }
 
       // outras mensagens ignoradas silenciosamente
@@ -238,12 +274,13 @@ class DerivTrader {
   }
 
   buyContract(digit, stake) {
+    if (this.pending_buy || this.active_contract_id || this.state !== "TRADING") return;
     const request = {
-      buy: 1,
+      buy: "1",
       price: stake,
       parameters: {
         contract_type: "DIGITMATCH",
-        symbol: CONFIG.symbol,
+        underlying_symbol: CONFIG.symbol,
         duration: 1,
         duration_unit: "t",
         basis: "stake",
@@ -252,6 +289,7 @@ class DerivTrader {
         currency: this.currency,
       },
     };
+    this.pending_buy = true;
     this.current_stake = stake;
     console.log(`\n💵 ENTRADA #${this.current_attempt}:`);
     console.log(`   Valor desta entrada: $${stake.toFixed(2)}`);
@@ -264,22 +302,26 @@ class DerivTrader {
 
   handleContractUpdate(contract) {
     const status = contract.status;
-    const contract_id = contract.contract_id || "N/A";
+    const contract_id = String(contract.contract_id);
 
-    if (status === "open") return;
+    if (status === "open" || (!contract.is_sold && status !== "won" && status !== "lost") || this.settled_contracts.has(contract_id)) return;
+    this.settled_contracts.add(contract_id);
+    this.active_contract_id = null;
+    if (this.contract_subscription_id) {
+      this.safeSend({ forget: this.contract_subscription_id });
+      this.contract_subscription_id = null;
+    }
 
-    let profit = 0.0;
-    let buy_price = 0.0;
-    try {
-      profit = parseFloat(contract.profit || 0) || 0.0;
-    } catch (e) {
-      profit = 0.0;
+    const profit = Number(contract.profit);
+    const buy_price = Number(contract.buy_price);
+    if (contract.profit == null || contract.buy_price == null ||
+        !Number.isFinite(profit) || !Number.isFinite(buy_price)) {
+      console.error("Resultado de contrato incompleto; operações interrompidas");
+      this.state = "STOPPED";
+      return;
     }
-    try {
-      buy_price = parseFloat(contract.buy_price || 0) || 0.0;
-    } catch (e) {
-      buy_price = 0.0;
-    }
+    this.total_invested += buy_price - this.current_stake;
+    this.current_stake = buy_price;
 
     const payout_received = buy_price + profit;
 
@@ -296,9 +338,8 @@ class DerivTrader {
       console.log(`✅ GANHOU! Prêmio: $${payout_received.toFixed(2)}`);
       console.log("=".repeat(60));
       // pede ao servidor "esquecer" streams ticks
-      try {
-        this.safeSend({ forget_all: "ticks" });
-      } catch (e) {}
+      if (this.tick_subscription_id) this.safeSend({ forget: this.tick_subscription_id });
+      this.tick_subscription_id = null;
       this.generateFinalReport();
       this.state = "STOPPED";
       this.awaiting_restart = true;
@@ -310,41 +351,7 @@ class DerivTrader {
     console.log("\n" + "=".repeat(60));
     console.log(`❌ PERDEU! Perda: $${Math.abs(profit).toFixed(2)}`);
 
-    // tenta obter número sorteado via tick_stream
-    let printed_number = null;
-    const tick_stream =
-      contract.tick_stream ||
-      contract.tick_stream_raw ||
-      contract.ticks ||
-      null;
-    if (tick_stream) {
-      try {
-        if (Array.isArray(tick_stream) && tick_stream.length > 0) {
-          const last = tick_stream[tick_stream.length - 1];
-          if (typeof last === "object" && last !== null && "tick" in last) {
-            printed_number = String(last.tick);
-          } else {
-            printed_number = String(last);
-          }
-        } else {
-          printed_number = String(tick_stream);
-        }
-      } catch (e) {
-        printed_number = null;
-      }
-    }
-
-    if (!printed_number && this.last_tick_price != null) {
-      printed_number = String(this.last_tick_price);
-    }
-
-    if (printed_number) {
-      const withoutDot = printed_number.replace(".", "");
-      const last_digit = withoutDot.charAt(withoutDot.length - 1);
-      console.log(`🎲 Número sorteado: ${withoutDot} | ${last_digit}`);
-    } else {
-      console.log("🎲 Número sorteado: (não informado)");
-    }
+    console.log(`🎲 Cotação de saída: ${contract.exit_spot ?? "(não informada)"}`);
 
     console.log(
       `📊 Total investido até agora: $${this.total_invested.toFixed(2)}`
@@ -353,7 +360,6 @@ class DerivTrader {
     if (this.current_attempt < CONFIG.max_attempts) {
       this.current_attempt += 1;
       const stake = this.calculateStake(this.current_attempt);
-      this.total_invested += stake;
       console.log(
         `🔄 Próxima tentativa: ${this.current_attempt}/${CONFIG.max_attempts}`
       );
@@ -421,11 +427,9 @@ class DerivTrader {
           this.current_stake = 0.0;
           this.contracts_history = [];
           this.final_payout = 0.0;
+          this.settled_contracts.clear();
           this.awaiting_restart = false;
-          try {
-            this.subscribeTicks();
-          } catch (e) {}
-          // obtém novo dígito via graph/getBestDigit
+          // Atualiza o alvo antes de voltar a contar ticks.
           try {
             const new_digit = await getBestDigit(true);
             if (new_digit !== null && new_digit !== undefined) {
@@ -436,6 +440,7 @@ class DerivTrader {
           } catch (e) {
             // mantém dígito atual se falhar
           }
+          this.subscribeTicks();
         } else {
           console.log("\n👋 Encerrando operações...");
           try {
@@ -452,22 +457,29 @@ async function get_best_digit() {
   console.log("=".repeat(60));
   console.log("📊 ANALISANDO MERCADO...");
   console.log("=".repeat(60));
-  try {
-    const best_digit = await getBestDigit(true);
-    return best_digit != null ? best_digit : 0;
-  } catch (e) {
-    return 0;
-  }
+  const best_digit = await getBestDigit(true);
+  if (best_digit == null) throw new Error("Histórico de ticks vazio");
+  return best_digit;
 }
 
 // se executado diretamente
 if (require.main === module) {
   (async () => {
+    if (!CONFIG.api_token || !CONFIG.app_id || !CONFIG.account_id) {
+      console.error("Defina DERIV_API_TOKEN, DERIV_APP_ID e DERIV_ACCOUNT_ID");
+      process.exitCode = 1;
+      return;
+    }
     console.log("\n" + "=".repeat(60));
     console.log("🤖 DERIV TRADING BOT - DÍGITO COMBINA");
     console.log("=".repeat(60));
 
-    const best_digit = await get_best_digit();
+    let best_digit;
+    try { best_digit = await get_best_digit(); } catch (error) {
+      console.error("Erro na análise:", error.message);
+      process.exitCode = 1;
+      return;
+    }
 
     const rl = readline.createInterface({
       input: process.stdin,
@@ -481,9 +493,10 @@ if (require.main === module) {
           .trim()
           .toLowerCase();
         if (resp === "s") {
-          const trader = new DerivTrader(best_digit);
+          rl.close();
           try {
-            trader.connect();
+            const trader = new DerivTrader(best_digit);
+            await trader.connect();
           } catch (err) {
             console.error("Erro ao conectar:", err);
           }
@@ -495,7 +508,7 @@ if (require.main === module) {
                 .trim()
                 .toLowerCase();
               if (r2 === "s") {
-                rl.question("Digite o dígito desejado (0-9): ", (d) => {
+                rl.question("Digite o dígito desejado (0-9): ", async (d) => {
                   const manual_digit = Number(d);
                   rl.close();
                   if (
@@ -503,9 +516,9 @@ if (require.main === module) {
                     manual_digit >= 0 &&
                     manual_digit <= 9
                   ) {
-                    const trader = new DerivTrader(manual_digit);
                     try {
-                      trader.connect();
+                      const trader = new DerivTrader(manual_digit);
+                      await trader.connect();
                     } catch (err) {
                       console.error("Erro ao conectar:", err);
                     }

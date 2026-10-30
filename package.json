@@ -1,4 +1,10 @@
 {
+  "scripts": {
+    "tick": "node script.js",
+    "analyze": "node deriv_digits.js",
+    "trade": "node trade.js",
+    "test": "node --test --test-isolation=none"
+  },
   "dependencies": {
     "ws": "^8.18.3"
   }

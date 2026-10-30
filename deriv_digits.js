@@ -1,15 +1,10 @@
-// Salve como deriv_digits.js
-// Requer: npm install ws
-
 const WebSocket = require("ws");
+const { PUBLIC_WS_URL, lastDigit } = require("./deriv_api");
 
 const CONFIG = {
-  app_id: 1089, // App ID público da Deriv
-  symbol: "R_25", // Volatility 25 Index
+  symbol: process.env.DERIV_SYMBOL || "1HZ25V",
   count: 50, // Quantidade de ticks para análise
 };
-
-const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${CONFIG.app_id}`;
 
 class DigitAnalyzer {
   constructor() {
@@ -18,10 +13,8 @@ class DigitAnalyzer {
     this.bestDigit = null;
   }
 
-  getLastDigit(price) {
-    // Extrai o último dígito do preço (remove ponto decimal)
-    const priceStr = String(price).replace(".", "");
-    return parseInt(priceStr.charAt(priceStr.length - 1), 10);
+  getLastDigit(price, pipSize) {
+    return lastDigit(price, pipSize);
   }
 
   analyzeTicks(ticksHistory) {
@@ -29,14 +22,14 @@ class DigitAnalyzer {
     for (const tick of ticksHistory) {
       const price = tick.quote;
       const epoch = tick.epoch;
-      const lastDigit = this.getLastDigit(price);
+      const digit = this.getLastDigit(price, tick.pip_size);
 
       this.ticksData.push({
         time: new Date(epoch * 1000),
         price,
-        digit: lastDigit,
+        digit,
       });
-      this.digits.push(lastDigit);
+      this.digits.push(digit);
     }
   }
 
@@ -59,6 +52,7 @@ class DigitAnalyzer {
   }
 
   getBestDigitInfo() {
+    if (this.digits.length === 0) return null;
     const stats = this.getStatistics();
     return stats.length > 0 ? stats[0] : null;
   }
@@ -114,8 +108,13 @@ function getBestDigit(display = true) {
   return new Promise((resolve, reject) => {
     const analyzer = new DigitAnalyzer();
     let ws;
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Tempo esgotado ao buscar histórico de ticks"));
+    }, 15000);
 
     function cleanup() {
+      clearTimeout(timeout);
       try {
         if (ws && ws.readyState === WebSocket.OPEN) ws.close();
       } catch (e) {
@@ -124,7 +123,7 @@ function getBestDigit(display = true) {
     }
 
     try {
-      ws = new WebSocket(wsUrl);
+      ws = new WebSocket(PUBLIC_WS_URL);
 
       ws.on("open", () => {
         if (display) {
@@ -173,10 +172,17 @@ function getBestDigit(display = true) {
             ticksHistory.push({
               quote: prices[i],
               epoch: times[i],
+              pip_size: response.pip_size,
             });
           }
 
-          analyzer.analyzeTicks(ticksHistory);
+          try {
+            analyzer.analyzeTicks(ticksHistory);
+          } catch (error) {
+            cleanup();
+            reject(error);
+            return;
+          }
 
           if (display) analyzer.displayAnalysis();
 
@@ -202,9 +208,8 @@ function getBestDigit(display = true) {
             reason ? reason.toString() : "none",
             ")"
           );
-        // Caso a conexão feche sem termos resolvido ainda, resolvemos com o que tivermos
-        const best = analyzer.getBestDigitInfo();
-        resolve(best ? best.digit : null);
+        clearTimeout(timeout);
+        if (!analyzer.digits.length) reject(new Error("Conexão encerrada sem histórico"));
       });
     } catch (ex) {
       cleanup();

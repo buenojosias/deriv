@@ -1,14 +1,13 @@
 const WebSocket = require('ws');
+const { PUBLIC_WS_URL, lastDigit } = require('./deriv_api');
 
 // CONFIGURAÇÕES
 const CONFIG = {
-  appId: 1089, // App ID público da Deriv
-  symbol: 'R_25', // Volatility 25 Index
+  symbol: process.env.DERIV_SYMBOL || '1HZ25V',
 };
 
 // Conecta ao WebSocket da Deriv
-const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${CONFIG.appId}`;
-const ws = new WebSocket(wsUrl);
+const ws = new WebSocket(PUBLIC_WS_URL);
 
 ws.on('open', () => {
   console.log('✅ Conectado à Deriv API\n');
@@ -20,7 +19,12 @@ ws.on('open', () => {
 });
 
 ws.on('message', (data) => {
-  const response = JSON.parse(data);
+  let response;
+  try { response = JSON.parse(data); } catch (error) {
+    console.error('Resposta inválida:', error.message);
+    ws.close();
+    return;
+  }
   
   // Verifica se há erro
   if (response.error) {
@@ -32,14 +36,20 @@ ws.on('message', (data) => {
   // Processa o tick recebido
   if (response.msg_type === 'tick') {
     const tick = response.tick;
-    const lastDigit = getLastDigit(tick.quote);
+    if (tick?.quote == null) return;
+    let digit;
+    try { digit = lastDigit(tick.quote, tick.pip_size); } catch (error) {
+      console.error(error.message);
+      ws.close();
+      return;
+    }
     const time = new Date(tick.epoch * 1000);
     
     console.log('📊 ÚLTIMA MOVIMENTAÇÃO:');
     console.log('─────────────────────────────────');
     console.log(`⏰ Horário: ${time.toLocaleString('pt-BR')}`);
-    console.log(`💰 Preço: ${tick.quote}`);
-    console.log(`🎲 Último Dígito: ${lastDigit}`);
+    console.log(`💰 Preço: ${Number(tick.quote).toFixed(tick.pip_size)}`);
+    console.log(`🎲 Último Dígito: ${digit}`);
     console.log(`📍 Símbolo: ${tick.symbol}`);
     console.log('─────────────────────────────────\n');
     
@@ -54,11 +64,4 @@ ws.on('error', (error) => {
 
 ws.on('close', () => {
   console.log('🔌 Conexão encerrada');
-  process.exit(0);
 });
-
-// Função para extrair o último dígito
-function getLastDigit(price) {
-  const priceStr = price.toString().replace('.', '');
-  return parseInt(priceStr[priceStr.length - 1]);
-}
