@@ -1,8 +1,10 @@
 const WebSocket = require("ws");
 const readline = require("node:readline/promises");
+const path = require("node:path");
 require("./load_env").loadEnv();
-const { getBestDigit } = require("./deriv_digits");
+const { getDigitAnalysis } = require("./deriv_digits");
 const { authenticatedWsUrl, lastDigit } = require("./deriv_api");
+const { exitDigit, writeCycleReport } = require("./result_report");
 
 const CONFIG = {
   app_id: process.env.DERIV_APP_ID,
@@ -15,7 +17,7 @@ const CONFIG = {
 };
 
 class DerivTrader {
-  constructor(targetDigit) {
+  constructor(targetDigit, analysis = null) {
     if (!Number.isInteger(Number(targetDigit)) || Number(targetDigit) < 0 || Number(targetDigit) > 9) {
       throw new Error("O dígito alvo deve ser um inteiro de 0 a 9");
     }
@@ -24,6 +26,9 @@ class DerivTrader {
     }
 
     this.target_digit = Number(targetDigit);
+    this.analysis = analysis;
+    this.digits_before_count = [];
+    this.counting_ticks = [];
     this.ws = null;
     this.state = "ANALYZING"; // ANALYZING, WAITING, TRADING, DRAINING, STOPPED
     this.currency = null;
@@ -41,6 +46,7 @@ class DerivTrader {
     this.last_tick_key = null;
     this.sendQueue = Promise.resolve(); // acompanha envios pendentes nos testes
     this.awaiting_restart = false;
+    this.results_directory = path.join(__dirname, "results");
     console.log(`\n🎯 DÍGITO ALVO: ${this.target_digit}`);
   }
 
@@ -194,6 +200,11 @@ class DerivTrader {
     }
 
     if (this.state === "ANALYZING") {
+      this.digits_before_count.push({
+        time: new Date(tick.epoch * 1000).toTimeString().split(" ")[0],
+        price: String(tick.quote),
+        digit,
+      });
       if (digit === this.target_digit) {
         this.state = "WAITING";
         this.digits_after_target = 0;
@@ -203,6 +214,7 @@ class DerivTrader {
     }
     if (this.state === "WAITING") {
       this.digits_after_target = digit === this.target_digit ? 0 : this.digits_after_target + 1;
+      this.counting_ticks.push({ digit, count: this.digits_after_target });
       console.log(`🎲 Dígito: ${digit} | Contagem: ${this.digits_after_target}/${CONFIG.wait_after_target}`);
       if (this.digits_after_target >= CONFIG.wait_after_target) {
         this.state = "TRADING";
@@ -287,7 +299,14 @@ class DerivTrader {
     this.open_contracts.delete(id);
     this.total_invested += buyPrice - record.stake;
     const payout = buyPrice + profit;
-    this.contracts_history.push({ attempt: record.attempt, stake: buyPrice, profit, payout });
+    this.contracts_history.push({
+      attempt: record.attempt,
+      contractId: id,
+      stake: buyPrice,
+      returnedDigit: exitDigit(contract.exit_spot),
+      profit,
+      payout,
+    });
     console.log(`${profit > 0 ? "✅" : "❌"} Contrato #${record.attempt} ${contract.status}: ${profit.toFixed(2)} ${this.currency}`);
     if (record.subscriptionId) this.safeSend({ forget: record.subscriptionId });
     this.maybeFinalize();
@@ -331,6 +350,24 @@ class DerivTrader {
     console.log(`Total investido: ${this.total_invested.toFixed(2)} ${this.currency}`);
     console.log(`Total recebido: ${payouts.toFixed(2)} ${this.currency}`);
     console.log(`Resultado líquido: ${profit.toFixed(2)} ${this.currency}\n`);
+    try {
+      const reportPath = writeCycleReport({
+        directory: this.results_directory,
+        symbol: CONFIG.symbol,
+        targetDigit: this.target_digit,
+        contracts: this.contracts_history,
+        ordersSent: this.current_attempt,
+        totalInvested: this.total_invested,
+        currency: this.currency,
+        analysis: this.analysis,
+        digitsBeforeCount: this.digits_before_count,
+        countingTicks: this.counting_ticks,
+        waitAfterTarget: CONFIG.wait_after_target,
+      });
+      console.log(`📄 Relatório salvo em: ${reportPath}`);
+    } catch (error) {
+      console.error(`❌ Não foi possível salvar o relatório: ${error.message}`);
+    }
   }
 
   async askRestart() {
@@ -344,15 +381,18 @@ class DerivTrader {
     }
     this.awaiting_restart = false;
     try {
-      const digit = await getBestDigit(true);
-      if (digit == null) throw new Error("Histórico vazio");
-      this.target_digit = digit;
+      const analysis = await getDigitAnalysis(true);
+      if (analysis.bestDigit == null) throw new Error("Histórico vazio");
+      this.target_digit = analysis.bestDigit;
+      this.analysis = analysis;
     } catch (error) {
       this.stopWithError(`Falha na nova análise: ${error.message}`);
       return;
     }
     this.state = "ANALYZING";
     this.digits_after_target = 0;
+    this.digits_before_count = [];
+    this.counting_ticks = [];
     this.current_attempt = 0;
     this.total_invested = 0;
     this.contracts_history = [];
@@ -370,7 +410,8 @@ async function main() {
     throw new Error("Defina DERIV_API_TOKEN, DERIV_APP_ID e DERIV_ACCOUNT_ID");
   }
   console.log("🤖 DERIV TRADING BOT - DÍGITO COMBINA");
-  const suggested = await getBestDigit(true);
+  const analysis = await getDigitAnalysis(true);
+  const suggested = analysis.bestDigit;
   if (suggested == null) throw new Error("Histórico de ticks vazio");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const answer = (await rl.question(`Dígito sugerido: ${suggested}. Iniciar? (s/n): `)).trim().toLowerCase();
@@ -384,7 +425,7 @@ async function main() {
     digit = Number(await rl.question("Dígito (0-9): "));
   }
   rl.close();
-  const trader = new DerivTrader(digit);
+  const trader = new DerivTrader(digit, analysis);
   await trader.connect();
 }
 

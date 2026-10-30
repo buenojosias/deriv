@@ -1,5 +1,6 @@
 const WebSocket = require("ws");
 const { PUBLIC_WS_URL, lastDigit } = require("./deriv_api");
+require("./load_env").loadEnv();
 
 const CONFIG = {
   symbol: process.env.DERIV_SYMBOL || "1HZ25V",
@@ -57,6 +58,20 @@ class DigitAnalyzer {
     return stats.length > 0 ? stats[0] : null;
   }
 
+  getAnalysis() {
+    return {
+      symbol: CONFIG.symbol,
+      count: this.ticksData.length,
+      last10: this.ticksData.slice(-10).map((tick) => ({
+        time: tick.time.toTimeString().split(" ")[0],
+        price: String(tick.price),
+        digit: tick.digit,
+      })),
+      frequency: this.getStatistics(),
+      bestDigit: this.getBestDigitInfo()?.digit ?? null,
+    };
+  }
+
   displayAnalysis() {
     console.log("\n" + "=".repeat(60));
     console.log(`📊 ANÁLISE DOS ÚLTIMOS ${this.ticksData.length} TICKS`);
@@ -101,10 +116,10 @@ class DigitAnalyzer {
 }
 
 /**
- * getBestDigit(display = true) -> Promise<number|null>
+ * getDigitAnalysis(display = true) -> Promise<object>
  * Conecta na Deriv, solicita ticks_history e analisa os dígitos.
  */
-function getBestDigit(display = true) {
+function getDigitAnalysis(display = true) {
   return new Promise((resolve, reject) => {
     const analyzer = new DigitAnalyzer();
     let ws;
@@ -186,10 +201,9 @@ function getBestDigit(display = true) {
 
           if (display) analyzer.displayAnalysis();
 
-          // resolve com o melhor dígito (ou null)
-          const best = analyzer.getBestDigitInfo();
+          const analysis = analyzer.getAnalysis();
           cleanup();
-          resolve(best ? best.digit : null);
+          resolve(analysis);
         }
       });
 
@@ -218,6 +232,10 @@ function getBestDigit(display = true) {
   });
 }
 
+async function getBestDigit(display = true) {
+  return (await getDigitAnalysis(display)).bestDigit;
+}
+
 // Se executado diretamente: mostra a análise completa
 if (require.main === module) {
   (async () => {
@@ -231,4 +249,4 @@ if (require.main === module) {
 }
 
 // Export para uso em outros módulos
-module.exports = { getBestDigit, DigitAnalyzer, CONFIG };
+module.exports = { getBestDigit, getDigitAnalysis, DigitAnalyzer, CONFIG };
