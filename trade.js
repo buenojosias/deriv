@@ -16,6 +16,16 @@ const CONFIG = {
   wait_after_target: 6,
 };
 
+async function chooseDigit(suggested, question) {
+  const answer = (await question(`Dígito sugerido: ${suggested}. Iniciar? (s/n): `)).trim().toLowerCase();
+  if (answer === "s") return suggested;
+  const manual = (await question("Escolher outro dígito? (s/n): ")).trim().toLowerCase();
+  if (manual !== "s") return null;
+  const value = (await question("Dígito (0-9): ")).trim();
+  if (!/^[0-9]$/.test(value)) throw new Error("O dígito alvo deve ser um inteiro de 0 a 9");
+  return Number(value);
+}
+
 class DerivTrader {
   constructor(targetDigit, analysis = null) {
     if (!Number.isInteger(Number(targetDigit)) || Number(targetDigit) < 0 || Number(targetDigit) > 9) {
@@ -370,38 +380,44 @@ class DerivTrader {
     }
   }
 
-  async askRestart() {
+  async askRestart({ analyze = getDigitAnalysis, createInterface = readline.createInterface } = {}) {
     if (!this.awaiting_restart) return;
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const answer = (await rl.question("Iniciar novo ciclo? (s/n): ")).trim().toLowerCase();
-    rl.close();
-    if (answer !== "s") {
-      this.ws?.close();
-      return;
-    }
-    this.awaiting_restart = false;
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
     try {
-      const analysis = await getDigitAnalysis(true);
+      const answer = (await rl.question("Iniciar novo ciclo? (s/n): ")).trim().toLowerCase();
+      if (answer !== "s") {
+        this.ws?.close();
+        return;
+      }
+      const analysis = await analyze(true);
       if (analysis.bestDigit == null) throw new Error("Histórico vazio");
-      this.target_digit = analysis.bestDigit;
+      const digit = await chooseDigit(analysis.bestDigit, (prompt) => rl.question(prompt));
+      if (digit == null) {
+        this.ws?.close();
+        return;
+      }
+      this.target_digit = digit;
       this.analysis = analysis;
+      this.state = "ANALYZING";
+      this.digits_after_target = 0;
+      this.digits_before_count = [];
+      this.counting_ticks = [];
+      this.current_attempt = 0;
+      this.total_invested = 0;
+      this.contracts_history = [];
+      this.pending_buys.clear();
+      this.open_contracts.clear();
+      this.settled_contracts.clear();
+      this.last_tick_key = null;
+      this.subscribeTicks();
+      console.log(`🎯 Novo dígito alvo: ${this.target_digit}`);
     } catch (error) {
-      this.stopWithError(`Falha na nova análise: ${error.message}`);
-      return;
+      console.error(`❌ Falha ao iniciar novo ciclo: ${error.message}`);
+      this.ws?.close();
+    } finally {
+      this.awaiting_restart = false;
+      rl.close();
     }
-    this.state = "ANALYZING";
-    this.digits_after_target = 0;
-    this.digits_before_count = [];
-    this.counting_ticks = [];
-    this.current_attempt = 0;
-    this.total_invested = 0;
-    this.contracts_history = [];
-    this.pending_buys.clear();
-    this.open_contracts.clear();
-    this.settled_contracts.clear();
-    this.last_tick_key = null;
-    this.subscribeTicks();
-    console.log(`🎯 Novo dígito alvo: ${this.target_digit}`);
   }
 }
 
@@ -414,17 +430,13 @@ async function main() {
   const suggested = analysis.bestDigit;
   if (suggested == null) throw new Error("Histórico de ticks vazio");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const answer = (await rl.question(`Dígito sugerido: ${suggested}. Iniciar? (s/n): `)).trim().toLowerCase();
-  let digit = suggested;
-  if (answer !== "s") {
-    const manual = (await rl.question("Escolher outro dígito? (s/n): ")).trim().toLowerCase();
-    if (manual !== "s") {
-      rl.close();
-      return;
-    }
-    digit = Number(await rl.question("Dígito (0-9): "));
+  let digit;
+  try {
+    digit = await chooseDigit(suggested, (prompt) => rl.question(prompt));
+  } finally {
+    rl.close();
   }
-  rl.close();
+  if (digit == null) return;
   const trader = new DerivTrader(digit, analysis);
   await trader.connect();
 }
@@ -436,4 +448,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { DerivTrader, CONFIG };
+module.exports = { DerivTrader, CONFIG, chooseDigit };

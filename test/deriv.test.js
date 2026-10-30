@@ -8,6 +8,57 @@ const { DigitAnalyzer } = require("../deriv_digits");
 const { loadEnv } = require("../load_env");
 const { exitDigit } = require("../result_report");
 
+test("a escolha do dígito permite confirmar, trocar ou cancelar", async () => {
+  process.env.DERIV_API_TOKEN = "teste";
+  process.env.DERIV_APP_ID = "123";
+  process.env.DERIV_ACCOUNT_ID = "DOT123";
+  const { chooseDigit } = require("../trade");
+  const answers = (values) => async () => values.shift();
+  assert.equal(await chooseDigit(4, answers(["s"])), 4);
+  assert.equal(await chooseDigit(4, answers(["n", "s", "8"])), 8);
+  assert.equal(await chooseDigit(4, answers(["n", "n"])), null);
+  await assert.rejects(chooseDigit(4, answers(["n", "s", "10"])), /dígito alvo/);
+});
+
+test("novo ciclo aguarda confirmação após a análise antes de assinar ticks", async () => {
+  const { DerivTrader } = require("../trade");
+  const trader = new DerivTrader(7);
+  trader.state = "STOPPED";
+  trader.awaiting_restart = true;
+  const sent = [];
+  trader.ws = {
+    readyState: 1,
+    send: (payload, callback) => { sent.push(JSON.parse(payload)); callback(); },
+    close: () => {},
+  };
+  const prompts = [];
+  let answerSuggestion;
+  const rl = {
+    question: (prompt) => {
+      prompts.push(prompt);
+      if (prompts.length === 1) return Promise.resolve("s");
+      return new Promise((resolve) => { answerSuggestion = resolve; });
+    },
+    close: () => {},
+  };
+  const analysis = { bestDigit: 3, count: 50, last10: [], frequency: [] };
+  const restarting = trader.askRestart({ analyze: async () => analysis, createInterface: () => rl });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /Dígito sugerido: 3\. Iniciar\?/);
+  assert.equal(trader.state, "STOPPED");
+  assert.equal(sent.length, 0);
+  answerSuggestion("s");
+  await restarting;
+  await trader.sendQueue;
+  assert.equal(trader.state, "ANALYZING");
+  assert.equal(trader.target_digit, 3);
+  assert.equal(trader.analysis, analysis);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].subscribe, 1);
+  assert.ok(sent[0].ticks);
+});
+
 test("carrega o arquivo de variáveis sem sobrescrever o ambiente", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "deriv-env-"));
   const file = path.join(dir, ".env");
