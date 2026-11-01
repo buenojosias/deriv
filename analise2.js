@@ -7,10 +7,11 @@ const { getDigitAnalysis } = require("./deriv_digits");
 const { PUBLIC_WS_URL, lastDigit } = require("./deriv_api");
 
 const SYMBOL = process.env.DERIV_SYMBOL || "1HZ25V";
-const TICK_COUNT = 50;
-const MIN_FREQUENCY = 18;
+const TICK_COUNT = 30;
+const HISTORY_COUNT = 50;
+const MIN_FREQUENCY = 10;
 const RETRY_DELAY_MS = 30_000;
-const REPEAT_DELAY_MS = 60_000;
+const REPEAT_DELAY_MS = 30_000;
 
 function timestamp(date) {
   const pad = (value) => String(value).padStart(2, "0");
@@ -34,7 +35,7 @@ async function promptMode(createInterface = readline.createInterface) {
   }
 }
 
-function collectNextDigits(symbol = SYMBOL, afterEpoch = null, targetDigit = null, WebSocketImpl = WebSocket) {
+function collectNextDigits(symbol = SYMBOL, afterEpoch = null, WebSocketImpl = WebSocket) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocketImpl(PUBLIC_WS_URL);
     const digits = [];
@@ -77,7 +78,7 @@ function collectNextDigits(symbol = SYMBOL, afterEpoch = null, targetDigit = nul
       }
       lastTickKey = key;
       digits.push(digit);
-      console.log(`${String(digits.length).padStart(2)} / ${TICK_COUNT} | Dígito: ${digit}${digit === targetDigit ? " ★" : ""}`);
+      console.log(`${String(digits.length).padStart(2)} / ${TICK_COUNT} | Dígito: ${digit}`);
       if (digits.length === TICK_COUNT) finish();
     });
     ws.on("error", (error) => finish(error));
@@ -104,8 +105,8 @@ function writeAnalysisReport({ directory, startedAt, symbol, analysis, digits })
     ...analysis.frequency.map((stat) =>
       `Dígito ${stat.digit}: ${String(stat.count).padStart(2)}x (${stat.percentage.toFixed(1)}%) ${"█".repeat(Math.floor(stat.percentage / 2))}`),
     "",
-    `PRÓXIMOS ${TICK_COUNT} DÍGITOS (★ = dígito mais frequente)`,
-    ...digits.map((digit, index) => `${String(index + 1).padStart(2, "0")}: ${digit}${digit === best.digit ? " ★" : ""}`),
+    `PRÓXIMOS ${TICK_COUNT} DÍGITOS`,
+    ...digits.map((digit, index) => `${String(index + 1).padStart(2, "0")}: ${digit}`),
     "",
     `Sequência exata: ${digits.join(" ")}`,
   ];
@@ -123,8 +124,8 @@ async function main({ analyze = getDigitAnalysis, collect = collectNextDigits, w
   while (true) {
     const startedAt = now();
     const analysis = await analyze(true);
-    if (analysis.count !== TICK_COUNT || !analysis.frequency?.length) {
-      throw new Error(`A análise deve conter exatamente ${TICK_COUNT} ticks`);
+    if (analysis.count !== HISTORY_COUNT || analysis.frequency?.length < 3 || analysis.last10?.length !== 10) {
+      throw new Error(`A análise deve conter exatamente ${HISTORY_COUNT} ticks, os últimos 10 e o ranking de frequência`);
     }
     const best = analysis.frequency[0];
     if (best.percentage < MIN_FREQUENCY) {
@@ -132,13 +133,20 @@ async function main({ analyze = getDigitAnalysis, collect = collectNextDigits, w
       await wait(RETRY_DELAY_MS);
       continue;
     }
-    console.log(`Dígito ${best.digit} atingiu ${best.percentage.toFixed(1)}%. Registrando os próximos ${TICK_COUNT} ticks.`);
-    const digits = await collect(SYMBOL, analysis.lastTickEpoch, best.digit);
+    const third = analysis.frequency[2];
+    const recentCount = (digit) => analysis.last10.filter((tick) => tick.digit === digit).length;
+    if (recentCount(best.digit) > 1 && recentCount(third.digit) > 1) {
+      console.log(`Dígitos ${best.digit} e ${third.digit} apareceram mais de uma vez nos últimos 10 ticks. Nova análise em 30 segundos.`);
+      await wait(RETRY_DELAY_MS);
+      continue;
+    }
+    console.log(`Registrando os próximos ${TICK_COUNT} ticks.`);
+    const digits = await collect(SYMBOL, analysis.lastTickEpoch);
     if (digits.length !== TICK_COUNT) throw new Error(`Recebidos ${digits.length} de ${TICK_COUNT} ticks`);
     const reportPath = writeAnalysisReport({ directory, startedAt, symbol: SYMBOL, analysis, digits });
     console.log(`Relatório salvo em: ${reportPath}`);
     if (mode === "1") return reportPath;
-    console.log("Nova análise em 1 minuto.");
+    console.log("Nova análise em 30 segundos.");
     await wait(REPEAT_DELAY_MS);
   }
 }
