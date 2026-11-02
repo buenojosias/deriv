@@ -1,7 +1,8 @@
 const WebSocket = require("ws");
+const readline = require("node:readline/promises");
 const path = require("node:path");
 require("./load_env").loadEnv();
-const { getDigitAnalysis } = require("./deriv_digits");
+const { getDigitAnalysis, getFreshDigitAnalysis } = require("./deriv_digits");
 const { authenticatedWsUrl, lastDigit } = require("./deriv_api");
 const { exitDigit, writeCycleReport } = require("./result_report");
 
@@ -63,6 +64,7 @@ class DerivTrader {
     this.tick_subscription_id = null;
     this.awaiting_next_tick = false;
     this.last_tick_key = null;
+    this.last_tick_epoch = null;
     this.sendQueue = Promise.resolve(); // acompanha envios pendentes nos testes
     this.awaiting_restart = false;
     this.results_directory = path.join(__dirname, "results");
@@ -210,6 +212,7 @@ class DerivTrader {
     const key = tick.epoch == null ? null : `${tick.epoch}:${tick.quote}`;
     if (key && key === this.last_tick_key) return;
     this.last_tick_key = key;
+    if (tick.epoch != null) this.last_tick_epoch = tick.epoch;
 
     if (this.state === "TRADING") {
       if (!this.awaiting_next_tick) return;
@@ -372,10 +375,26 @@ class DerivTrader {
     }
   }
 
-  async askRestart({ analyze = getDigitAnalysis, delay } = {}) {
+  async askRestart({ analyze, delay, createInterface = readline.createInterface } = {}) {
     if (!this.awaiting_restart) return;
     try {
-      const { analysis, targetDigit } = await waitForTarget(analyze, delay);
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      let answer;
+      try {
+        do {
+          answer = (await rl.question("Executar o processo novamente? (s/n): ")).trim().toLowerCase();
+          if (!["s", "sim", "n", "não", "nao"].includes(answer)) console.log("Responda s ou n.");
+        } while (!["s", "sim", "n", "não", "nao"].includes(answer));
+      } finally {
+        rl.close();
+      }
+      if (["n", "não", "nao"].includes(answer)) {
+        this.ws?.close();
+        return;
+      }
+      const afterEpoch = this.last_tick_epoch ?? Math.floor(Date.now() / 1000);
+      const analyzeFresh = analyze || ((display) => getFreshDigitAnalysis(display, afterEpoch));
+      const { analysis, targetDigit } = await waitForTarget(analyzeFresh, delay);
       if (this.ws?.readyState !== WebSocket.OPEN) return;
       this.target_digit = targetDigit;
       this.analysis = analysis;

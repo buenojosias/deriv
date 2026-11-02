@@ -225,6 +225,69 @@ function getDigitAnalysis(display = true) {
   });
 }
 
+/** Coleta 50 ticks recebidos após o encerramento do ciclo anterior. */
+function getFreshDigitAnalysis(display = true, afterEpoch = null, WebSocketImpl = WebSocket) {
+  return new Promise((resolve, reject) => {
+    const analyzer = new DigitAnalyzer();
+    let ws;
+    let finished = false;
+    let lastKey = null;
+    const timeout = setTimeout(() => finish(new Error("Tempo esgotado ao aguardar 50 novos ticks")), 300000);
+
+    function finish(error, analysis) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      if (ws?.readyState === WebSocket.OPEN) ws.close();
+      if (error) reject(error);
+      else resolve(analysis);
+    }
+
+    try {
+      ws = new WebSocketImpl(PUBLIC_WS_URL);
+      ws.on("open", () => {
+        if (display) console.log(`📥 Aguardando 50 novos ticks de ${CONFIG.symbol} para a próxima análise...`);
+        ws.send(JSON.stringify({ ticks: CONFIG.symbol, subscribe: 1 }));
+      });
+      ws.on("message", (raw) => {
+        let response;
+        try {
+          response = JSON.parse(raw);
+        } catch (error) {
+          finish(error);
+          return;
+        }
+        if (response.error) {
+          finish(new Error(response.error.message || "Erro ao coletar novos ticks"));
+          return;
+        }
+        if (response.msg_type !== "tick" || response.tick?.quote == null) return;
+        const tick = response.tick;
+        if (tick.epoch == null || (afterEpoch != null && tick.epoch <= afterEpoch)) return;
+        const key = `${tick.epoch}:${tick.quote}`;
+        if (key === lastKey) return;
+        lastKey = key;
+        try {
+          analyzer.analyzeTicks([{ quote: tick.quote, epoch: tick.epoch, pip_size: tick.pip_size }]);
+        } catch (error) {
+          finish(error);
+          return;
+        }
+        if (analyzer.digits.length === CONFIG.count) {
+          if (display) analyzer.displayAnalysis();
+          finish(null, analyzer.getAnalysis());
+        }
+      });
+      ws.on("error", (error) => finish(error));
+      ws.on("close", () => {
+        if (!finished) finish(new Error("Conexão encerrada antes de receber 50 novos ticks"));
+      });
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
 async function getBestDigit(display = true) {
   return (await getDigitAnalysis(display)).bestDigit;
 }
@@ -242,4 +305,4 @@ if (require.main === module) {
 }
 
 // Export para uso em outros módulos
-module.exports = { getBestDigit, getDigitAnalysis, DigitAnalyzer, CONFIG };
+module.exports = { getBestDigit, getDigitAnalysis, getFreshDigitAnalysis, DigitAnalyzer, CONFIG };
