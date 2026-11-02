@@ -10,7 +10,8 @@ function exitDigit(exitSpot) {
 }
 
 function writeCycleReport({ directory, symbol, targetDigit, contracts, ordersSent, totalInvested, currency,
-  analysis, digitsBeforeCount = [], countingTicks = [], waitAfterTarget = 6 }) {
+  analysis, digitsBeforeCount = [], countingTicks = [], waitAfterTarget = 6,
+  filename, includeCounting = true }) {
   const settled = [...contracts].sort((a, b) => a.attempt - b.attempt);
   const totalReceived = settled.reduce((sum, item) => sum + item.payout, 0);
   const money = (value) => `${value.toFixed(2)} ${currency}`;
@@ -42,20 +43,22 @@ function writeCycleReport({ directory, symbol, targetDigit, contracts, ordersSen
       ? analysis.frequency.map((stat) =>
         `Dígito ${stat.digit}: ${String(stat.count).padStart(2)}x (${stat.percentage.toFixed(1)}%) ${"█".repeat(Math.floor(stat.percentage / 2))}`)
       : ["Indisponível"]),
-    "",
-    "Dígitos antes de iniciar a contagem (inclui o dígito alvo que a iniciou):",
-    ...(digitsBeforeCount.length ? digitsBeforeCount.map(formatTick) : ["Nenhum"]),
-    "",
-    "Contagem dos dígitos antes de iniciar as compras:",
-    ...(countingTicks.length
-      ? countingTicks.map(({ digit, count }) => `Dígito: ${digit} | Contagem: ${count}/${waitAfterTarget}`)
-      : ["Nenhum"]),
+    ...(includeCounting ? [
+      "",
+      "Dígitos antes de iniciar a contagem (inclui o dígito alvo que a iniciou):",
+      ...(digitsBeforeCount.length ? digitsBeforeCount.map(formatTick) : ["Nenhum"]),
+      "",
+      "Contagem dos dígitos antes de iniciar as compras:",
+      ...(countingTicks.length
+        ? countingTicks.map(({ digit, count }) => `Dígito: ${digit} | Contagem: ${count}/${waitAfterTarget}`)
+        : ["Nenhum"]),
+    ] : []),
   ];
 
   fs.mkdirSync(directory, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const filename = `ciclo-${timestamp}-${randomUUID()}.txt`;
-  const filePath = path.join(directory, filename);
+  const reportFilename = filename || `ciclo-${timestamp}-${randomUUID()}.txt`;
+  const filePath = path.join(directory, reportFilename);
   fs.writeFileSync(filePath, `${lines.join("\n")}\n`, { encoding: "utf8", flag: "wx" });
   return filePath;
 }
