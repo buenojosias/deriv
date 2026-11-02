@@ -21,17 +21,6 @@ function writeCycleReport({ directory, symbol, targetDigit, contracts, ordersSen
     `Deriv symbol: ${symbol}`,
     `Dígito alvo: ${targetDigit}`,
     "",
-    "Ordens do ciclo:",
-    ...settled.map((item) =>
-      `Ordem #${item.attempt} | Contrato: ${item.contractId} | Valor da entrada: ${money(item.stake)} | Dígito retornado: ${item.returnedDigit ?? "indisponível"}`
-    ),
-    "",
-    `Ordens enviadas: ${ordersSent}`,
-    `Contratos liquidados: ${settled.length}`,
-    `Total investido: ${money(totalInvested)}`,
-    `Total recebido: ${money(totalReceived)}`,
-    `Resultado líquido: ${money(totalReceived - totalInvested)}`,
-    "",
     `ANÁLISE DOS ÚLTIMOS ${analysis?.count ?? 0} TICKS`,
     "Últimos 10 ticks:",
     ...(analysis?.last10?.length
@@ -53,6 +42,17 @@ function writeCycleReport({ directory, symbol, targetDigit, contracts, ordersSen
         ? countingTicks.map(({ digit, count }) => `Dígito: ${digit} | Contagem: ${count}/${waitAfterTarget}`)
         : ["Nenhum"]),
     ] : []),
+    "",
+    "Ordens do ciclo:",
+    ...settled.map((item) =>
+      `Ordem #${item.attempt} | Contrato: ${item.contractId} | Valor da entrada: ${money(item.stake)} | Dígito retornado: ${item.returnedDigit ?? "indisponível"}`
+    ),
+    "",
+    `Ordens enviadas: ${ordersSent}`,
+    `Contratos liquidados: ${settled.length}`,
+    `Total investido: ${money(totalInvested)}`,
+    `Total recebido: ${money(totalReceived)}`,
+    `Resultado líquido: ${money(totalReceived - totalInvested)}`,
   ];
 
   fs.mkdirSync(directory, { recursive: true });

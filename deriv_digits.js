@@ -104,15 +104,7 @@ class DigitAnalyzer {
     }
 
     const best = this.getBestDigitInfo();
-    if (best) {
-      this.bestDigit = best.digit;
-      console.log("\n" + "=".repeat(60));
-      console.log(`🎯 MELHOR DÍGITO: ${best.digit}`);
-      console.log(
-        `   Frequência: ${best.count}x (${best.percentage.toFixed(1)}%)`
-      );
-      console.log("=".repeat(60) + "\n");
-    }
+    if (best) this.bestDigit = best.digit;
   }
 }
 

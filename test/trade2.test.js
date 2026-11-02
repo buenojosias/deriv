@@ -82,5 +82,9 @@ test("salva relatório sem contagem com o nome da data local", (t) => {
   assert.equal(formatReportFilename(new Date(2026, 10, 2, 13, 4, 5)), "2026-11-02 13:04:05.txt");
   const report = fs.readFileSync(path.join(trader.results_directory, files[0]), "utf8");
   assert.match(report, /RELATÓRIO DO CICLO DERIV/);
+  assert.ok(report.indexOf("ANÁLISE DOS ÚLTIMOS 50 TICKS") < report.indexOf("Últimos 10 ticks:"));
+  assert.ok(report.indexOf("Últimos 10 ticks:") < report.indexOf("Frequência dos dígitos:"));
+  assert.ok(report.indexOf("Frequência dos dígitos:") < report.indexOf("Ordens do ciclo:"));
+  assert.ok(report.indexOf("Ordens do ciclo:") < report.indexOf("Resultado líquido:"));
   assert.doesNotMatch(report, /Contagem dos dígitos/);
 });
